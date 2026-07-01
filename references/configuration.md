@@ -49,6 +49,7 @@ GITHUB_TOKEN = ""
 GROK_SEARCH_TIMEOUT_SECONDS = 120
 GROK_SEARCH_MAX_RETRIES = 5
 GROK_SEARCH_FETCH_MAX_CHARS = 0
+GROK_SEARCH_ALLOW_INTERNAL_FETCH = false
 GROK_SEARCH_RESPONSE_MAX_CHARS = 60000
 ```
 
@@ -70,6 +71,7 @@ Environment variables are intentionally limited to scalar values. They cannot de
 | `GROK_SEARCH_MAX_RETRIES` | Additional Grok search retries after the first failed attempt. Any Grok error triggers retry until this count is exhausted, then `web_search` falls back to Tavily when configured. Default: `5`. |
 | `SEARCH_CACHE_DIR` | Optional search session cache directory. Default uses the system temp directory. |
 | `GROK_SEARCH_FETCH_MAX_CHARS` | Default `fetch` character cap. |
+| `GROK_SEARCH_ALLOW_INTERNAL_FETCH` | Allows `web_fetch` and `web_map` to target private/internal `http(s)` URLs. Default: `false`. Provider endpoints are explicit config and can use private gateways independently. |
 | `GROK_SEARCH_RESPONSE_MAX_CHARS` | Default `search` response budget. |
 
 ## Provider Selection

@@ -51,7 +51,8 @@ Read `references/tools-and-best-practices.md` for command options and output han
 - Multiple upstreams are configured in `config.toml` arrays such as `GROK_SEARCH_UPSTREAMS = [{ ... }]`; environment variables only support legacy single-upstream scalar values.
 - `GROK_SEARCH_*` upstreams use OpenAI-compatible `/v1/chat/completions`; `doctor` reports the normalized AI `api_url` and redacted environment-variable presence.
 - Empty or partially filled upstream objects are ignored.
-- Persistent local secrets should prefer `%USERPROFILE%\.config\grok-search-skill\config.toml` so skill updates do not overwrite them.
+- `GROK_SEARCH_ALLOW_INTERNAL_FETCH` defaults to `false`; set it to `true` only when `web_fetch` or `web_map` must read private/internal `http(s)` URLs. Provider endpoints may use private gateways independently.
+- Persistent local secrets should prefer the platform-appropriate user config path (`%USERPROFILE%\.config\grok-search-skill\config.toml` on Windows, `$HOME/.config/grok-search-skill/config.toml` on macOS/Linux) so skill updates do not overwrite them.
 - `WEB_RESEARCH_CONFIG` is a lowest-priority fallback config path in this skill, not an override.
 
 ## Success Criteria

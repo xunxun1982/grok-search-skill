@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import html
+import ipaddress
 import json
 import os
 import random
 import re
+import socket
 import sys
 import tempfile
 import time
@@ -40,6 +42,7 @@ SUPPORTED_ENV_NAMES = [
     "GROK_SEARCH_MAX_RETRIES",
     "SEARCH_CACHE_DIR",
     "GROK_SEARCH_FETCH_MAX_CHARS",
+    "GROK_SEARCH_ALLOW_INTERNAL_FETCH",
     "GROK_SEARCH_RESPONSE_MAX_CHARS",
 ]
 
@@ -162,30 +165,11 @@ def config_file_candidates() -> list[Path]:
     return dedupe_paths(skill_config_candidates() + fallback_config_candidates())
 
 
-def read_simple_toml(text: str) -> dict[str, Any]:
-    data: dict[str, Any] = {}
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if not line or line.startswith("[") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip("\"'")
-        if value.lower() in {"true", "false"}:
-            data[key] = value.lower() == "true"
-        else:
-            try:
-                data[key] = int(value)
-            except ValueError:
-                data[key] = value
-    return data
-
-
 def read_config_file(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
-    if tomllib is not None:
-        return tomllib.loads(text)
-    return read_simple_toml(text)
+    if tomllib is None:  # pragma: no cover - Python < 3.11 only
+        raise RuntimeError("Python 3.11+ is required to parse TOML configuration")
+    return tomllib.loads(text)
 
 
 def merge_missing(target: dict[str, Any], source: dict[str, Any]) -> None:
@@ -299,6 +283,10 @@ class Config:
         return self.get_int("GROK_SEARCH_FETCH_MAX_CHARS", 0)
 
     @property
+    def allow_internal_fetch(self) -> bool:
+        return self.get_bool("GROK_SEARCH_ALLOW_INTERNAL_FETCH", False)
+
+    @property
     def response_max_chars(self) -> int:
         return self.get_int("GROK_SEARCH_RESPONSE_MAX_CHARS", 60000)
 
@@ -322,6 +310,50 @@ def is_timeout_error(exc: BaseException) -> bool:
     return "timed out" in str(exc).lower()
 
 
+def is_internal_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return not ip.is_global
+
+
+def validate_web_url(url: str, *, allow_internal: bool = False) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HttpError(400, "URL must use http or https")
+    if parsed.username or parsed.password:
+        raise HttpError(400, "URL credentials are not allowed")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise HttpError(400, "invalid URL port") from exc
+    if allow_internal:
+        # Provider endpoints are explicit local config and may point to private gateways.
+        return
+
+    # User-supplied fetch URLs must stay on public web targets to avoid SSRF.
+    host = parsed.hostname.strip().rstrip(".").lower()
+    if host in {"localhost", "localhost.localdomain"}:
+        raise HttpError(400, "internal URL targets are not allowed")
+    if is_internal_address(host):
+        raise HttpError(400, "internal URL targets are not allowed")
+
+    try:
+        resolved = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise HttpError(0, f"network failure: {exc}") from exc
+    for *_, sockaddr in resolved:
+        if sockaddr and is_internal_address(str(sockaddr[0])):
+            raise HttpError(400, "internal URL targets are not allowed")
+
+
+class PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        validate_web_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def request_text(
     method: str,
     url: str,
@@ -329,7 +361,9 @@ def request_text(
     headers: dict[str, str] | None = None,
     payload: dict[str, Any] | None = None,
     timeout: int = 60,
+    allow_internal: bool = False,
 ) -> str:
+    validate_web_url(url, allow_internal=allow_internal)
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     request_headers = {
         "User-Agent": USER_AGENT,
@@ -340,12 +374,15 @@ def request_text(
         request_headers.setdefault("Content-Type", "application/json")
     req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        opener = urllib.request if allow_internal else urllib.request.build_opener(PublicRedirectHandler)
+        with opener.urlopen(req, timeout=timeout) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
             return resp.read().decode(charset, errors="replace")
     except urllib.error.HTTPError as exc:
         error_text = exc.read().decode("utf-8", errors="replace")
         raise HttpError(exc.code, error_text[:2000]) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise HttpError(0, f"network failure: {exc}") from exc
 
 
 def request_json(
@@ -355,8 +392,16 @@ def request_json(
     headers: dict[str, str] | None = None,
     payload: dict[str, Any] | None = None,
     timeout: int = 60,
+    allow_internal: bool = False,
 ) -> dict[str, Any]:
-    text = request_text(method, url, headers=headers, payload=payload, timeout=timeout)
+    text = request_text(
+        method,
+        url,
+        headers=headers,
+        payload=payload,
+        timeout=timeout,
+        allow_internal=allow_internal,
+    )
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
@@ -454,6 +499,7 @@ def ai_search(cfg: Config, query: str) -> dict[str, Any] | None:
         headers=bearer_headers(key),
         payload=payload,
         timeout=cfg.timeout,
+        allow_internal=True,
     )
 
     return {
@@ -503,6 +549,7 @@ def tavily_search(
         headers=bearer_headers(key),
         payload=payload,
         timeout=cfg.timeout,
+        allow_internal=True,
     )
     results = data.get("results", [])
     sources: list[dict[str, Any]] = []
@@ -560,6 +607,10 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
     for attempt in range(max_retries + 1):
         try:
             ai_result = ai_search(cfg, args.query)
+            if ai_result is None:
+                ai_failed = True
+                warnings.append("AI provider not configured; using Tavily fallback.")
+                break
             ai_failed = False
             break
         except Exception as exc:  # noqa: BLE001
@@ -771,7 +822,14 @@ def tavily_extract(url: str, cfg: Config) -> str | None:
     endpoint = upstream.get("tavily_api_url", "https://api.tavily.com").rstrip("/") + "/extract"
     payload = {"urls": [url], "extract_depth": "advanced"}
 
-    data = request_json("POST", endpoint, headers=bearer_headers(key), payload=payload, timeout=cfg.timeout)
+    data = request_json(
+        "POST",
+        endpoint,
+        headers=bearer_headers(key),
+        payload=payload,
+        timeout=cfg.timeout,
+        allow_internal=True,
+    )
     results = data.get("results") or []
     if isinstance(results, list) and results:
         first = results[0]
@@ -795,21 +853,24 @@ def firecrawl_extract(url: str, cfg: Config) -> str | None:
         headers=bearer_headers(key),
         payload={"url": url, "formats": ["markdown"]},
         timeout=cfg.timeout,
+        allow_internal=True,
     )
     payload = data.get("data") if isinstance(data.get("data"), dict) else data
     return payload.get("markdown") or payload.get("content")
 
 
-def plain_fetch(url: str, cfg: Config) -> str:
-    text = request_text("GET", url, timeout=cfg.timeout)
+def plain_fetch(url: str, cfg: Config, *, allow_internal: bool = False) -> str:
+    text = request_text("GET", url, timeout=cfg.timeout, allow_internal=allow_internal)
     return strip_html(text)
 
 
 def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
+    validate_web_url(args.url, allow_internal=cfg.allow_internal_fetch)
     max_chars = args.max_chars or cfg.fetch_max_chars or 0
     warnings: list[str] = []
     source_type = "generic"
     content: str | None = None
+    use_external_extract = not cfg.allow_internal_fetch
 
     for name, fetcher in [
         ("github", github_fetch),
@@ -825,7 +886,7 @@ def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"{name} specialized fetch failed: {exc}")
 
-    if content is None:
+    if content is None and use_external_extract:
         for name, fetcher in [("tavily", tavily_extract), ("firecrawl", firecrawl_extract)]:
             try:
                 content = fetcher(args.url, cfg)
@@ -836,7 +897,7 @@ def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
                 warnings.append(f"{name} fetch failed: {exc}")
 
     if content is None:
-        content = plain_fetch(args.url, cfg)
+        content = plain_fetch(args.url, cfg, allow_internal=cfg.allow_internal_fetch)
         source_type = "plain-http"
 
     original_length = len(content)
@@ -882,6 +943,7 @@ def command_sources(args: argparse.Namespace, cfg: Config) -> None:
 
 
 def command_map(args: argparse.Namespace, cfg: Config) -> None:
+    validate_web_url(args.url, allow_internal=cfg.allow_internal_fetch)
     upstream = random_upstream(cfg, "tavily")
     if not upstream or not upstream.get("tavily_api_key"):
         raise SystemExit("TAVILY_API_KEY is required for map")
@@ -893,6 +955,7 @@ def command_map(args: argparse.Namespace, cfg: Config) -> None:
         headers=bearer_headers(upstream["tavily_api_key"]),
         payload=payload,
         timeout=cfg.timeout,
+        allow_internal=True,
     )
     raw_results = data.get("results") or data.get("urls") or []
     urls: list[str] = []

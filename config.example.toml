@@ -20,9 +20,10 @@ TAVILY_UPSTREAMS = [
 # Optional. Raises GitHub issue/PR API limits and supports private repositories.
 GITHUB_TOKEN = ""
 
-GROK_SEARCH_TIMEOUT_SECONDS = 60
+GROK_SEARCH_TIMEOUT_SECONDS = 120
 GROK_SEARCH_MAX_RETRIES = 5
 GROK_SEARCH_FETCH_MAX_CHARS = 0
+GROK_SEARCH_ALLOW_INTERNAL_FETCH = false
 GROK_SEARCH_RESPONSE_MAX_CHARS = 60000
 # By default, search sessions are cached under the system temp directory.
 # Set this only if you explicitly want a persistent cache.
