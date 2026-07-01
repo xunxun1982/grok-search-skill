@@ -1,0 +1,29 @@
+# Copy this file to config.toml in the same directory and fill only the keys you need.
+# Do not commit config.toml with real keys.
+# Add more objects as needed. Only objects with all fields filled are used.
+
+FIRECRAWL_UPSTREAMS = [
+  { FIRECRAWL_API_KEY = "fc-123456", FIRECRAWL_API_URL = "https://api.firecrawl.dev" },
+  { FIRECRAWL_API_KEY = "", FIRECRAWL_API_URL = "" },
+]
+
+GROK_SEARCH_UPSTREAMS = [
+  { GROK_SEARCH_API_KEY = "sk-123456", GROK_SEARCH_MODEL = "grok-4.20-fast", GROK_SEARCH_URL = "https://api.x.ai" },
+  { GROK_SEARCH_API_KEY = "", GROK_SEARCH_MODEL = "", GROK_SEARCH_URL = "" },
+]
+
+TAVILY_UPSTREAMS = [
+  { TAVILY_API_KEY = "tvly-123456", TAVILY_API_URL = "https://api.tavily.com" },
+  { TAVILY_API_KEY = "", TAVILY_API_URL = "" },
+]
+
+# Optional. Raises GitHub issue/PR API limits and supports private repositories.
+GITHUB_TOKEN = ""
+
+GROK_SEARCH_TIMEOUT_SECONDS = 60
+GROK_SEARCH_MAX_RETRIES = 5
+GROK_SEARCH_FETCH_MAX_CHARS = 0
+GROK_SEARCH_RESPONSE_MAX_CHARS = 60000
+# By default, search sessions are cached under the system temp directory.
+# Set this only if you explicitly want a persistent cache.
+# SEARCH_CACHE_DIR = "D:\\Temp\\grok-search-skill\\cache"

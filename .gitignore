@@ -1,0 +1,18 @@
+# Ignore non-core files by default.
+*
+
+# Repository metadata that must remain committable.
+!.gitignore
+!LICENSE
+
+# Core skill files mirrored from the installed skill.
+!README.md
+!SKILL.md
+!config.example.toml
+!agents/
+!agents/openai.yaml
+!references/
+!references/configuration.md
+!references/tools-and-best-practices.md
+!scripts/
+!scripts/groksearch.py
