@@ -7,13 +7,10 @@ import html
 import ipaddress
 import json
 import os
-import queue
 import random
 import re
-import socket
 import sys
 import tempfile
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -377,69 +374,8 @@ def is_internal_address(address: str) -> bool:
     return not ip.is_global
 
 
-def resolve_host(host: str, port: int | None, timeout: float) -> list[Any]:
-    result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-    def worker() -> None:
-        try:
-            result.put((True, socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)), block=False)
-        except OSError as exc:
-            result.put((False, exc), block=False)
-
-    # DNS preflight runs before urlopen, so it needs its own caller-bound timeout.
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    try:
-        ok, value = result.get(timeout=max(float(timeout), 0.001))
-    except queue.Empty as exc:
-        raise HttpError(0, "network failure: DNS lookup timed out") from exc
-    if not ok:
-        raise HttpError(0, f"network failure: {value}") from value
-    return value
-
-
-def parsed_url_port(parsed: urllib.parse.ParseResult) -> int:
-    if parsed.port is not None:
-        return parsed.port
-    return 443 if parsed.scheme == "https" else 80
-
-
-def normalized_dns_host(host: str) -> str:
-    return host.strip("[]").rstrip(".").lower()
-
-
-def pin_url_dns(url: str, resolved: list[Any], pins: dict[tuple[str, int], list[Any]]) -> None:
-    parsed = urllib.parse.urlparse(url)
-    if parsed.hostname:
-        pins[(normalized_dns_host(parsed.hostname), parsed_url_port(parsed))] = resolved
-
-
-_DNS_PIN_LOCK = threading.Lock()
-
-
-class PinnedDNS:
-    def __init__(self, pins: dict[tuple[str, int], list[Any]]):
-        self.pins = pins
-        self.original_getaddrinfo = socket.getaddrinfo
-
-    def __enter__(self) -> None:
-        def getaddrinfo(host, port, *args, **kwargs):
-            try:
-                key = (normalized_dns_host(str(host)), int(port))
-            except (TypeError, ValueError):
-                key = ("", -1)
-            if key in self.pins:
-                return self.pins[key]
-            return self.original_getaddrinfo(host, port, *args, **kwargs)
-
-        # urllib resolves hostnames inside urlopen; pin vetted answers for this request.
-        socket.getaddrinfo = getaddrinfo
-
-    def __exit__(self, *_args) -> None:
-        socket.getaddrinfo = self.original_getaddrinfo
-
-
-def validate_web_url(url: str, *, allow_internal: bool = False, timeout: float = 60) -> list[Any]:
+def validate_web_url(url: str, *, allow_internal: bool = False, timeout: float = 60) -> None:
+    del timeout
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise HttpError(400, "URL must use http or https")
@@ -451,30 +387,23 @@ def validate_web_url(url: str, *, allow_internal: bool = False, timeout: float =
         raise HttpError(400, "invalid URL port") from exc
     host = parsed.hostname.strip().rstrip(".").lower()
     if not allow_internal:
-        # User-supplied fetch URLs must stay on public web targets to avoid SSRF.
+        # Do not DNS-resolve hostnames here. Local proxy DNS such as Clash may
+        # return reserved proxy IPs like 198.18.0.0/15 for public domains, and
+        # external extract APIs cannot use the user's local DNS result anyway.
+        # Only reject literal internal hosts/IPs from the URL itself.
         if host in {"localhost", "localhost.localdomain"}:
             raise HttpError(400, "internal URL targets are not allowed")
         if is_internal_address(host):
             raise HttpError(400, "internal URL targets are not allowed")
 
-    # Internal targets skip only address rejection; DNS still stays timeout-bound.
-    resolved = resolve_host(host, parsed_url_port(parsed), timeout)
-    if not allow_internal:
-        for *_, sockaddr in resolved:
-            if sockaddr and is_internal_address(str(sockaddr[0])):
-                raise HttpError(400, "internal URL targets are not allowed")
-    return resolved
-
 
 class PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def __init__(self, timeout: float = 60, *, allow_internal: bool = False, dns_pins: dict[tuple[str, int], list[Any]] | None = None):
+    def __init__(self, timeout: float = 60, *, allow_internal: bool = False):
         self.timeout = timeout
         self.allow_internal = allow_internal
-        self.dns_pins = dns_pins if dns_pins is not None else {}
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
-        resolved = validate_web_url(newurl, allow_internal=self.allow_internal, timeout=self.timeout)
-        pin_url_dns(newurl, resolved, self.dns_pins)
+        validate_web_url(newurl, allow_internal=self.allow_internal, timeout=self.timeout)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -487,9 +416,7 @@ def request_text(
     timeout: int = 60,
     allow_internal: bool = False,
 ) -> str:
-    dns_pins: dict[tuple[str, int], list[Any]] = {}
-    resolved = validate_web_url(url, allow_internal=allow_internal, timeout=timeout)
-    pin_url_dns(url, resolved, dns_pins)
+    validate_web_url(url, allow_internal=allow_internal, timeout=timeout)
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     request_headers = {
         "User-Agent": USER_AGENT,
@@ -500,12 +427,10 @@ def request_text(
         request_headers.setdefault("Content-Type", "application/json")
     req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
     try:
-        opener = urllib.request.build_opener(PublicRedirectHandler(timeout, allow_internal=allow_internal, dns_pins=dns_pins))
-        with _DNS_PIN_LOCK:
-            with PinnedDNS(dns_pins):
-                with opener.open(req, timeout=timeout) as resp:
-                    charset = resp.headers.get_content_charset() or "utf-8"
-                    return resp.read().decode(charset, errors="replace")
+        opener = urllib.request.build_opener(PublicRedirectHandler(timeout, allow_internal=allow_internal))
+        with opener.open(req, timeout=timeout) as resp:
+            charset = resp.headers.get_content_charset() or "utf-8"
+            return resp.read().decode(charset, errors="replace")
     except urllib.error.HTTPError as exc:
         error_text = exc.read().decode("utf-8", errors="replace")
         raise HttpError(exc.code, error_text[:2000]) from exc
