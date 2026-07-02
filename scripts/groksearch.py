@@ -7,11 +7,13 @@ import html
 import ipaddress
 import json
 import os
+import queue
 import random
 import re
 import socket
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -318,7 +320,28 @@ def is_internal_address(address: str) -> bool:
     return not ip.is_global
 
 
-def validate_web_url(url: str, *, allow_internal: bool = False) -> None:
+def resolve_host(host: str, port: int | None, timeout: float) -> list[Any]:
+    result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            result.put((True, socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)), block=False)
+        except OSError as exc:
+            result.put((False, exc), block=False)
+
+    # DNS preflight runs before urlopen, so it needs its own caller-bound timeout.
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    try:
+        ok, value = result.get(timeout=max(float(timeout), 0.001))
+    except queue.Empty as exc:
+        raise HttpError(0, "network failure: DNS lookup timed out") from exc
+    if not ok:
+        raise HttpError(0, f"network failure: {value}") from value
+    return value
+
+
+def validate_web_url(url: str, *, allow_internal: bool = False, timeout: float = 60) -> None:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise HttpError(400, "URL must use http or https")
@@ -339,18 +362,18 @@ def validate_web_url(url: str, *, allow_internal: bool = False) -> None:
     if is_internal_address(host):
         raise HttpError(400, "internal URL targets are not allowed")
 
-    try:
-        resolved = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except socket.gaierror as exc:
-        raise HttpError(0, f"network failure: {exc}") from exc
+    resolved = resolve_host(host, port, timeout)
     for *_, sockaddr in resolved:
         if sockaddr and is_internal_address(str(sockaddr[0])):
             raise HttpError(400, "internal URL targets are not allowed")
 
 
 class PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, timeout: float = 60):
+        self.timeout = timeout
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
-        validate_web_url(newurl)
+        validate_web_url(newurl, timeout=self.timeout)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -363,7 +386,7 @@ def request_text(
     timeout: int = 60,
     allow_internal: bool = False,
 ) -> str:
-    validate_web_url(url, allow_internal=allow_internal)
+    validate_web_url(url, allow_internal=allow_internal, timeout=timeout)
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     request_headers = {
         "User-Agent": USER_AGENT,
@@ -374,7 +397,7 @@ def request_text(
         request_headers.setdefault("Content-Type", "application/json")
     req = urllib.request.Request(url, data=body, headers=request_headers, method=method)
     try:
-        opener = urllib.request if allow_internal else urllib.request.build_opener(PublicRedirectHandler)
+        opener = urllib.request if allow_internal else urllib.request.build_opener(PublicRedirectHandler(timeout))
         with opener.urlopen(req, timeout=timeout) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
             return resp.read().decode(charset, errors="replace")
@@ -865,7 +888,7 @@ def plain_fetch(url: str, cfg: Config, *, allow_internal: bool = False) -> str:
 
 
 def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
-    validate_web_url(args.url, allow_internal=cfg.allow_internal_fetch)
+    validate_web_url(args.url, allow_internal=cfg.allow_internal_fetch, timeout=cfg.timeout)
     max_chars = args.max_chars or cfg.fetch_max_chars or 0
     warnings: list[str] = []
     source_type = "generic"
@@ -943,7 +966,7 @@ def command_sources(args: argparse.Namespace, cfg: Config) -> None:
 
 
 def command_map(args: argparse.Namespace, cfg: Config) -> None:
-    validate_web_url(args.url, allow_internal=cfg.allow_internal_fetch)
+    validate_web_url(args.url, allow_internal=cfg.allow_internal_fetch, timeout=cfg.timeout)
     upstream = random_upstream(cfg, "tavily")
     if not upstream or not upstream.get("tavily_api_key"):
         raise SystemExit("TAVILY_API_KEY is required for map")
