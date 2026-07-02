@@ -430,7 +430,13 @@ def request_text(
         opener = urllib.request.build_opener(PublicRedirectHandler(timeout, allow_internal=allow_internal))
         with opener.open(req, timeout=timeout) as resp:
             charset = resp.headers.get_content_charset() or "utf-8"
-            return resp.read().decode(charset, errors="replace")
+            body_bytes = resp.read()
+            try:
+                return body_bytes.decode(charset, errors="replace")
+            except LookupError:
+                # Servers sometimes advertise non-standard charset labels; keep
+                # the CLI path stable by falling back to UTF-8 with replacement.
+                return body_bytes.decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         error_text = exc.read().decode("utf-8", errors="replace")
         raise HttpError(exc.code, error_text[:2000]) from exc
