@@ -351,21 +351,20 @@ def validate_web_url(url: str, *, allow_internal: bool = False, timeout: float =
         port = parsed.port
     except ValueError as exc:
         raise HttpError(400, "invalid URL port") from exc
-    if allow_internal:
-        # Provider endpoints are explicit local config and may point to private gateways.
-        return
-
-    # User-supplied fetch URLs must stay on public web targets to avoid SSRF.
     host = parsed.hostname.strip().rstrip(".").lower()
-    if host in {"localhost", "localhost.localdomain"}:
-        raise HttpError(400, "internal URL targets are not allowed")
-    if is_internal_address(host):
-        raise HttpError(400, "internal URL targets are not allowed")
-
-    resolved = resolve_host(host, port, timeout)
-    for *_, sockaddr in resolved:
-        if sockaddr and is_internal_address(str(sockaddr[0])):
+    if not allow_internal:
+        # User-supplied fetch URLs must stay on public web targets to avoid SSRF.
+        if host in {"localhost", "localhost.localdomain"}:
             raise HttpError(400, "internal URL targets are not allowed")
+        if is_internal_address(host):
+            raise HttpError(400, "internal URL targets are not allowed")
+
+    # Internal targets skip only address rejection; DNS still stays timeout-bound.
+    resolved = resolve_host(host, port, timeout)
+    if not allow_internal:
+        for *_, sockaddr in resolved:
+            if sockaddr and is_internal_address(str(sockaddr[0])):
+                raise HttpError(400, "internal URL targets are not allowed")
 
 
 class PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
