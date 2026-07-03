@@ -1384,6 +1384,8 @@ def command_map(args: argparse.Namespace, cfg: Config) -> None:
         urls = tavily_map(args.url, cfg, args.max_results)
         if urls is not None:
             source_type = "tavily"
+        else:
+            warnings.append("Tavily map not configured.")
     except Exception as exc:  # noqa: BLE001
         warnings.append(f"Tavily map failed: {exc}")
     if not urls:

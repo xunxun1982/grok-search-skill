@@ -82,7 +82,7 @@ Environment variables are intentionally limited to scalar values. They cannot de
 
 - With `GROK_SEARCH_UPSTREAMS`, `search` randomly selects one Grok/OpenAI-compatible upstream object for the AI answer and calls `/v1/chat/completions`.
 - `web_search --grok-max-retries` overrides `GROK_SEARCH_MAX_RETRIES` for that call. When the flag is omitted, the merged config value is used.
-- With `TAVILY_UPSTREAMS`, timed-out search fallback, generic fetch, and map randomly select one Tavily upstream object.
+- With `TAVILY_UPSTREAMS`, search fallback, generic fetch, and map randomly select one Tavily upstream object.
 - With `FIRECRAWL_UPSTREAMS`, generic `fetch` fallback randomly selects one Firecrawl upstream object.
 - Exa uses the official remote MCP endpoint free plan without local key config. `web_search` uses Exa after Tavily fallback fails, generic `web_fetch` uses Exa after Tavily and Firecrawl fail, and `web_map` uses Exa after Tavily fails or returns no URLs.
 - Legacy single-value `GROK_SEARCH_*`, `TAVILY_*`, and `FIRECRAWL_*` keys still work as fallback when no upstream table is configured.
