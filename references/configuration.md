@@ -30,11 +30,6 @@ TOML example:
 ```toml
 # Add more objects as needed. Only objects with all fields filled are used.
 
-FIRECRAWL_UPSTREAMS = [
-  { FIRECRAWL_API_KEY = "fc-123456", FIRECRAWL_API_URL = "https://api.firecrawl.dev" },
-  { FIRECRAWL_API_KEY = "", FIRECRAWL_API_URL = "" },
-]
-
 GROK_SEARCH_UPSTREAMS = [
   { GROK_SEARCH_API_KEY = "sk-123456", GROK_SEARCH_MODEL = "grok-4.3", GROK_SEARCH_URL = "https://api.x.ai" },
   { GROK_SEARCH_API_KEY = "", GROK_SEARCH_MODEL = "", GROK_SEARCH_URL = "" },
@@ -44,6 +39,13 @@ TAVILY_UPSTREAMS = [
   { TAVILY_API_KEY = "tvly-123456", TAVILY_API_URL = "https://api.tavily.com" },
   { TAVILY_API_KEY = "", TAVILY_API_URL = "" },
 ]
+
+FIRECRAWL_UPSTREAMS = [
+  { FIRECRAWL_API_KEY = "fc-123456", FIRECRAWL_API_URL = "https://api.firecrawl.dev" },
+  { FIRECRAWL_API_KEY = "", FIRECRAWL_API_URL = "" },
+]
+
+# Exa fallback uses the official free-plan MCP endpoint without local key config.
 
 GROK_SEARCH_TIMEOUT_SECONDS = 120
 GROK_SEARCH_MAX_RETRIES = 5
@@ -82,6 +84,7 @@ Environment variables are intentionally limited to scalar values. They cannot de
 - `web_search --grok-max-retries` overrides `GROK_SEARCH_MAX_RETRIES` for that call. When the flag is omitted, the merged config value is used.
 - With `TAVILY_UPSTREAMS`, timed-out search fallback, generic fetch, and map randomly select one Tavily upstream object.
 - With `FIRECRAWL_UPSTREAMS`, generic `fetch` fallback randomly selects one Firecrawl upstream object.
+- Exa uses the official remote MCP endpoint free plan without local key config. `web_search` uses Exa after Tavily fallback fails, generic `web_fetch` uses Exa after Tavily and Firecrawl fail, and `web_map` uses Exa after Tavily fails or returns no URLs.
 - Legacy single-value `GROK_SEARCH_*`, `TAVILY_*`, and `FIRECRAWL_*` keys still work as fallback when no upstream table is configured.
 - Empty or partially filled upstream objects are ignored.
 - With no provider keys, specialized public fetchers still work for GitHub, StackExchange, arXiv, and Wikipedia URLs.
