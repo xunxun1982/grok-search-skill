@@ -39,6 +39,9 @@ SUPPORTED_ENV_NAMES = [
     "GITHUB_TOKEN",
     "GROK_SEARCH_TIMEOUT_SECONDS",
     "GROK_SEARCH_MAX_RETRIES",
+    "SEARCH_PROVIDER_PRIORITY",
+    "FETCH_PROVIDER_PRIORITY",
+    "MAP_PROVIDER_PRIORITY",
     "SEARCH_CACHE_DIR",
     "GROK_SEARCH_FETCH_MAX_CHARS",
     "GROK_SEARCH_ALLOW_INTERNAL_FETCH",
@@ -47,6 +50,22 @@ SUPPORTED_ENV_NAMES = [
 APP_DIR_NAME = "web-search-skill"
 EXA_MCP_URL = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa"
 MCP_PROTOCOL_VERSION = "2025-06-18"
+DEFAULT_SEARCH_PROVIDER_PRIORITY = ["grok", "tavily", "exa"]
+DEFAULT_FETCH_PROVIDER_PRIORITY = ["tavily", "firecrawl", "exa", "plain"]
+DEFAULT_MAP_PROVIDER_PRIORITY = ["tavily", "exa"]
+PROVIDER_ALIASES = {
+    "ai": "grok",
+    "search": "grok",
+    "grok-search": "grok",
+    "plain-http": "plain",
+}
+PROVIDER_LABELS = {
+    "grok": "Grok",
+    "tavily": "Tavily",
+    "firecrawl": "Firecrawl",
+    "exa": "Exa",
+    "plain": "plain HTTP",
+}
 
 UPSTREAM_DEFAULTS = {
     "grok_search": {
@@ -215,6 +234,8 @@ def read_config_file(path: Path) -> dict[str, Any]:
 def config_value_is_effective(key: str, value: Any) -> bool:
     if isinstance(value, str):
         return bool(value.strip())
+    if key.endswith("_provider_priority") and isinstance(value, list):
+        return any(str(item).strip() for item in value)
     if key.endswith("_upstreams") and isinstance(value, list):
         provider = key[: -len("_upstreams")]
         return any(
@@ -309,6 +330,27 @@ def complete_upstream_count(cfg: "Config", provider: str) -> int:
             and has_required_upstream_values(provider, {**UPSTREAM_DEFAULTS.get(provider, {}), **lower_keys(raw)})
         )
     return int(random_upstream(cfg, provider) is not None)
+
+
+def provider_priority(cfg: "Config", env_name: str, default: list[str]) -> list[str]:
+    raw = cfg.file_values.get(env_name.lower())
+    if raw is None:
+        return list(default)
+    values: list[Any] = []
+    if isinstance(raw, list):
+        values = raw
+    elif isinstance(raw, str):
+        values = raw.split(",")
+    elif raw is not None:
+        values = [raw]
+
+    allowed = set(default)
+    result: list[str] = []
+    for value in values:
+        normalized = PROVIDER_ALIASES.get(str(value).strip().lower(), str(value).strip().lower())
+        if normalized in allowed and normalized not in result:
+            result.append(normalized)
+    return result
 
 
 @dataclasses.dataclass
@@ -602,12 +644,20 @@ def exa_mcp_tool_call(endpoint: str, tool_name: str, arguments: dict[str, Any], 
     return text
 
 
-def search_fallback_status(result: dict[str, Any] | None) -> str:
+def search_result_status(result: dict[str, Any] | None) -> str:
     if result is None:
         return "not configured"
-    if result.get("answer") or result.get("sources"):
+    if result.get("answer") or result.get("sources") or result.get("urls"):
         return ""
     return "returned no usable results"
+
+
+def fallback_warning(provider: str, status: str, next_provider: str = "") -> str:
+    label = PROVIDER_LABELS.get(provider, provider)
+    if next_provider:
+        next_label = PROVIDER_LABELS.get(next_provider, next_provider)
+        return f"{label} {status}; using {next_label} fallback."
+    return f"{label} {status}."
 
 
 def clean_found_url(url: str) -> str:
@@ -937,41 +987,52 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
     ai_result: dict[str, Any] | None = None
     tavily_result: dict[str, Any] | None = None
     exa_result: dict[str, Any] | None = None
-    ai_failed = False
+    priority = provider_priority(cfg, "SEARCH_PROVIDER_PRIORITY", DEFAULT_SEARCH_PROVIDER_PRIORITY)
 
-    for attempt in range(max_retries + 1):
-        try:
-            ai_result = ai_search(cfg, args.query)
-            if ai_result is None:
-                ai_failed = True
-                warnings.append("AI provider not configured; using search fallbacks.")
+    for index, provider in enumerate(priority):
+        next_provider = priority[index + 1] if index + 1 < len(priority) else ""
+        if provider == "grok":
+            grok_status = "unavailable"
+            for attempt in range(max_retries + 1):
+                try:
+                    ai_result = ai_search(cfg, args.query)
+                    grok_status = search_result_status(ai_result)
+                    if grok_status == "not configured":
+                        warnings.append("AI provider not configured; using search fallbacks.")
+                    elif grok_status:
+                        warnings.append(fallback_warning(provider, grok_status, next_provider))
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    error_type = "timed out" if is_timeout_error(exc) else "failed"
+                    warnings.append(f"AI provider attempt {attempt + 1}/{max_retries + 1} {error_type}: {exc}")
+            if not grok_status:
                 break
-            ai_failed = False
-            break
-        except Exception as exc:  # noqa: BLE001
-            ai_failed = True
-            error_type = "timed out" if is_timeout_error(exc) else "failed"
-            warnings.append(f"AI provider attempt {attempt + 1}/{max_retries + 1} {error_type}: {exc}")
+            ai_result = None
+            continue
 
-    if ai_failed:
-        tavily_error = False
-        try:
-            tavily_result = tavily_search(
-                cfg,
-                args.query,
-                max_sources=args.max_sources,
-                detailed=detailed,
-                include_domains=args.include_domain,
-                exclude_domains=args.exclude_domain,
-                recency_days=args.recency_days,
-            )
-        except Exception as exc:  # noqa: BLE001
-            tavily_error = True
-            warnings.append(f"Tavily failed: {exc}")
-        tavily_status = "unavailable" if tavily_error else search_fallback_status(tavily_result)
-        if tavily_status:
-            warnings.append(f"Tavily {tavily_status}; using Exa fallback.")
-            exa_error = False
+        if provider == "tavily":
+            try:
+                tavily_result = tavily_search(
+                    cfg,
+                    args.query,
+                    max_sources=args.max_sources,
+                    detailed=detailed,
+                    include_domains=args.include_domain,
+                    exclude_domains=args.exclude_domain,
+                    recency_days=args.recency_days,
+                )
+            except Exception as exc:  # noqa: BLE001
+                tavily_result = None
+                warnings.append(f"Tavily failed: {exc}")
+                continue
+            tavily_status = search_result_status(tavily_result)
+            if not tavily_status:
+                break
+            warnings.append(fallback_warning(provider, tavily_status, next_provider))
+            tavily_result = None
+            continue
+
+        if provider == "exa":
             try:
                 exa_result = exa_search(
                     cfg,
@@ -983,11 +1044,14 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
                     recency_days=args.recency_days,
                 )
             except Exception as exc:  # noqa: BLE001
-                exa_error = True
+                exa_result = None
                 warnings.append(f"Exa failed: {exc}")
-            exa_status = "" if exa_error else search_fallback_status(exa_result)
-            if exa_status:
-                warnings.append(f"Exa {exa_status}.")
+                continue
+            exa_status = search_result_status(exa_result)
+            if not exa_status:
+                break
+            warnings.append(fallback_warning(provider, exa_status, next_provider))
+            exa_result = None
 
     answer_parts: list[str] = []
     if ai_result and ai_result.get("answer"):
@@ -1255,6 +1319,8 @@ def tavily_map(url: str, cfg: Config, max_results: int) -> list[str] | None:
 
 def exa_map(url: str, cfg: Config, max_results: int) -> list[str] | None:
     parsed = urllib.parse.urlparse(url)
+    # Exa MCP has no dedicated sitemap/crawl tool here; this is a best-effort
+    # map fallback based on web_search_advanced_exa ranking, not exhaustive discovery.
     query = f"pages under {url}"
     payload: dict[str, Any] = {"query": query, "numResults": max_results}
     if parsed.hostname:
@@ -1320,7 +1386,16 @@ def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
             warnings.append(f"{name} specialized fetch failed: {exc}")
 
     if content is None and use_external_extract:
-        for name, fetcher in [("tavily", tavily_extract), ("firecrawl", firecrawl_extract), ("exa", exa_extract)]:
+        fetchers = {"tavily": tavily_extract, "firecrawl": firecrawl_extract, "exa": exa_extract}
+        fetch_priority = provider_priority(cfg, "FETCH_PROVIDER_PRIORITY", DEFAULT_FETCH_PROVIDER_PRIORITY)
+        for name in fetch_priority:
+            if name == "plain":
+                content = plain_fetch(args.url, cfg, allow_internal=cfg.allow_internal_fetch)
+                source_type = "plain-http"
+                break
+            fetcher = fetchers.get(name)
+            if fetcher is None:
+                continue
             try:
                 content = fetcher(args.url, cfg)
                 if content:
@@ -1330,8 +1405,13 @@ def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
                 warnings.append(f"{name} fetch failed: {exc}")
 
     if content is None:
-        content = plain_fetch(args.url, cfg, allow_internal=cfg.allow_internal_fetch)
-        source_type = "plain-http"
+        if use_external_extract:
+            content = ""
+            source_type = "none"
+            warnings.append("No enabled fetch provider returned content.")
+        else:
+            content = plain_fetch(args.url, cfg, allow_internal=cfg.allow_internal_fetch)
+            source_type = "plain-http"
 
     original_length = len(content)
     content, truncated = clamp_text(content, max_chars or None)
@@ -1380,21 +1460,22 @@ def command_map(args: argparse.Namespace, cfg: Config) -> None:
     warnings: list[str] = []
     urls: list[str] | None = None
     source_type = ""
-    try:
-        urls = tavily_map(args.url, cfg, args.max_results)
-        if urls is not None:
-            source_type = "tavily"
-        else:
-            warnings.append("Tavily map not configured.")
-    except Exception as exc:  # noqa: BLE001
-        warnings.append(f"Tavily map failed: {exc}")
-    if not urls:
+    for name in provider_priority(cfg, "MAP_PROVIDER_PRIORITY", DEFAULT_MAP_PROVIDER_PRIORITY):
         try:
-            urls = exa_map(args.url, cfg, args.max_results)
-            if urls is not None:
-                source_type = "exa"
+            if name == "tavily":
+                urls = tavily_map(args.url, cfg, args.max_results)
+                if urls is None:
+                    warnings.append("Tavily map not configured.")
+                    continue
+            elif name == "exa":
+                urls = exa_map(args.url, cfg, args.max_results)
+            else:
+                continue
+            source_type = name
+            if urls:
+                break
         except Exception as exc:  # noqa: BLE001
-            warnings.append(f"Exa map failed: {exc}")
+            warnings.append(f"{PROVIDER_LABELS.get(name, name)} map failed: {exc}")
     if urls is None:
         raise SystemExit("Map failed: " + ("; ".join(warnings) or "no map provider is configured"))
     page = urls[: args.max_results]
@@ -1412,6 +1493,11 @@ def command_doctor(args: argparse.Namespace, cfg: Config) -> None:
         "grok_search_upstreams": complete_upstream_count(cfg, "grok_search"),
         "tavily_upstreams": complete_upstream_count(cfg, "tavily"),
         "firecrawl_upstreams": complete_upstream_count(cfg, "firecrawl"),
+        "provider_priority": {
+            "search": provider_priority(cfg, "SEARCH_PROVIDER_PRIORITY", DEFAULT_SEARCH_PROVIDER_PRIORITY),
+            "fetch": provider_priority(cfg, "FETCH_PROVIDER_PRIORITY", DEFAULT_FETCH_PROVIDER_PRIORITY),
+            "map": provider_priority(cfg, "MAP_PROVIDER_PRIORITY", DEFAULT_MAP_PROVIDER_PRIORITY),
+        },
         "has_github_token": bool(cfg.get("GITHUB_TOKEN")),
         "environment": env_presence(),
     }

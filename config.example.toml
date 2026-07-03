@@ -1,7 +1,15 @@
 # Copy this file to the user config path or skill-local config.toml, then fill only the keys you need.
 # Do not commit config.toml with real keys.
-# Add more objects as needed. Only objects with all fields filled are used.
 
+# Provider priorities are evaluated in order. Providers omitted from a priority list are disabled.
+# SEARCH_PROVIDER_PRIORITY supports: "grok", "tavily", "exa".
+# FETCH_PROVIDER_PRIORITY supports: "tavily", "firecrawl", "exa", "plain".
+# MAP_PROVIDER_PRIORITY supports: "tavily", "exa".
+SEARCH_PROVIDER_PRIORITY = ["grok", "tavily", "exa"]
+FETCH_PROVIDER_PRIORITY = ["tavily", "firecrawl", "exa", "plain"]
+MAP_PROVIDER_PRIORITY = ["tavily", "exa"]
+
+# Add more objects as needed. Only objects with all fields filled are used.
 GROK_SEARCH_UPSTREAMS = [
   { GROK_SEARCH_API_KEY = "sk-123456", GROK_SEARCH_MODEL = "grok-4.3", GROK_SEARCH_URL = "https://api.x.ai" },
   { GROK_SEARCH_API_KEY = "", GROK_SEARCH_MODEL = "", GROK_SEARCH_URL = "" },

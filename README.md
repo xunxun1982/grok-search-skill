@@ -29,9 +29,10 @@ Important details:
 - Prefer config files for runtime settings. CLI parameters are intended for task inputs and explicit one-off overrides; when a CLI parameter maps to a config value, the CLI value wins for that call.
 - Agents should not add optional tuning flags by default, because that can silently override the user's configured behavior. Use config for retry counts, source limits, response budgets, timeouts, provider endpoints, cache paths, and similar settings unless the user explicitly asks for a different value on one command.
 - Environment variables cannot express `*_UPSTREAMS` arrays. Use `config.toml` for multiple upstreams.
-- Environment variables are still useful for legacy single-upstream keys (`GROK_SEARCH_API_KEY`, `GROK_SEARCH_URL`, `GROK_SEARCH_MODEL`, `TAVILY_API_KEY`, `TAVILY_API_URL`, `FIRECRAWL_API_KEY`, `FIRECRAWL_API_URL`) and scalar settings such as `GITHUB_TOKEN`, `GROK_SEARCH_TIMEOUT_SECONDS`, `GROK_SEARCH_MAX_RETRIES`, `SEARCH_CACHE_DIR`, `GROK_SEARCH_FETCH_MAX_CHARS`, `GROK_SEARCH_ALLOW_INTERNAL_FETCH`, and `GROK_SEARCH_RESPONSE_MAX_CHARS`.
+- Environment variables are useful for single-upstream keys (`GROK_SEARCH_API_KEY`, `GROK_SEARCH_URL`, `GROK_SEARCH_MODEL`, `TAVILY_API_KEY`, `TAVILY_API_URL`, `FIRECRAWL_API_KEY`, `FIRECRAWL_API_URL`) and scalar settings such as `GITHUB_TOKEN`, `GROK_SEARCH_TIMEOUT_SECONDS`, `GROK_SEARCH_MAX_RETRIES`, `SEARCH_PROVIDER_PRIORITY`, `FETCH_PROVIDER_PRIORITY`, `MAP_PROVIDER_PRIORITY`, `SEARCH_CACHE_DIR`, `GROK_SEARCH_FETCH_MAX_CHARS`, `GROK_SEARCH_ALLOW_INTERNAL_FETCH`, and `GROK_SEARCH_RESPONSE_MAX_CHARS`.
 - Exa fallback uses the official remote MCP endpoint free plan without local Exa key config.
-- `GROK_SEARCH_MAX_RETRIES` controls additional Grok `web_search` retries after the first failed attempt. Any Grok error triggers retry; after retries are exhausted, Tavily is used as fallback when configured, then Exa as the lowest-priority fallback.
+- `GROK_SEARCH_MAX_RETRIES` controls additional Grok `web_search` retries after the first failed attempt. Any Grok error triggers retry; default fallback order is Tavily then Exa, and provider priorities can be adjusted per command.
+- Provider priority values are `grok,tavily,exa` for `SEARCH_PROVIDER_PRIORITY`, `tavily,firecrawl,exa,plain` for `FETCH_PROVIDER_PRIORITY`, and `tavily,exa` for `MAP_PROVIDER_PRIORITY`; omitted providers are disabled when a priority list is configured.
 - `web_search --grok-max-retries` is a per-call override. If omitted, the merged config value is used.
 - `WEB_RESEARCH_CONFIG` is a fallback config path in the current implementation. It does not override standard user config files, environment variables, or skill-local config, and non-`.toml` paths are ignored.
 - The recommended place for persistent local secrets is the platform-appropriate user config path (`%USERPROFILE%\.config\web-search-skill\config.toml` on Windows, `$HOME/.config/web-search-skill/config.toml` on macOS/Linux).
@@ -57,8 +58,15 @@ $env:TAVILY_API_URL = "https://api.tavily.com"
 User or skill-local `config.toml` example:
 
 ```toml
-# Add more objects as needed. Only objects with all fields filled are used.
+# Provider priorities are evaluated in order. Providers omitted from a priority list are disabled.
+# SEARCH_PROVIDER_PRIORITY supports: "grok", "tavily", "exa".
+# FETCH_PROVIDER_PRIORITY supports: "tavily", "firecrawl", "exa", "plain".
+# MAP_PROVIDER_PRIORITY supports: "tavily", "exa".
+SEARCH_PROVIDER_PRIORITY = ["grok", "tavily", "exa"]
+FETCH_PROVIDER_PRIORITY = ["tavily", "firecrawl", "exa", "plain"]
+MAP_PROVIDER_PRIORITY = ["tavily", "exa"]
 
+# Add more objects as needed. Only objects with all fields filled are used.
 GROK_SEARCH_UPSTREAMS = [
   { GROK_SEARCH_API_KEY = "sk-123456", GROK_SEARCH_MODEL = "grok-4.3", GROK_SEARCH_URL = "https://api.x.ai" },
   { GROK_SEARCH_API_KEY = "", GROK_SEARCH_MODEL = "", GROK_SEARCH_URL = "" },

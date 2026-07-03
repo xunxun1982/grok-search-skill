@@ -49,8 +49,9 @@ Read `references/tools-and-best-practices.md` for command options and output han
 - Prefer persistent configuration over command-line overrides. Agents should normally pass only task-specific inputs such as `--query`, `--url`, `--session-id`, `--offset`, and `--limit`.
 - Standard user config files have priority over environment variables and skill-local `config.toml`.
 - Optional tuning flags such as retry counts, source limits, response budgets, timeouts, provider endpoints, cache paths, and similar runtime settings should live in config files. Pass them on the command line only when the user explicitly requests that override.
-- Multiple upstreams are configured in `config.toml` arrays such as `GROK_SEARCH_UPSTREAMS = [{ ... }]`; environment variables only support legacy single-upstream scalar values.
+- Multiple Grok/OpenAI-compatible upstreams are configured in `config.toml` arrays such as `GROK_SEARCH_UPSTREAMS = [{ ... }]`; environment variables only support single-upstream scalar values.
 - Exa fallback uses the official remote MCP endpoint free plan without local key config.
+- Provider priority is configurable per command with `SEARCH_PROVIDER_PRIORITY`, `FETCH_PROVIDER_PRIORITY`, and `MAP_PROVIDER_PRIORITY`; supported values are `grok,tavily,exa` for search, `tavily,firecrawl,exa,plain` for fetch, and `tavily,exa` for map. Providers omitted from a configured priority list are disabled.
 - Empty scalar values are treated as missing; optional scalar examples should stay commented out until configured.
 - `GROK_SEARCH_*` upstreams use OpenAI-compatible `/v1/chat/completions`; `doctor` reports the normalized AI `api_url` and redacted environment-variable presence.
 - `doctor` reports `config_files` with path priority and `exists` flags; use that before assuming configuration is missing.

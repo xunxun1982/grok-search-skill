@@ -32,8 +32,9 @@ Rules:
 - Use `--format detailed` only when inline source text is needed.
 - Save the returned `session_id`; use `get_sources` for review instead of repeating the same search.
 - If output is truncated, fetch the important URLs directly with `web_fetch`.
-- Any Grok provider error, including `429`, transport failure, parse failure, and timeout, is retryable. After `--grok-max-retries` additional attempts are exhausted, `web_search` uses Tavily fallback when configured, then Exa as the lowest-priority fallback.
+- Any Grok provider error, including `429`, transport failure, parse failure, and timeout, is retryable. With the default provider priority, after `--grok-max-retries` additional attempts are exhausted, `web_search` uses Tavily fallback when configured, then Exa as the lowest-priority fallback.
 - Omit `--grok-max-retries` to use the configured `GROK_SEARCH_MAX_RETRIES`; pass the flag only when the single call should override config.
+- `SEARCH_PROVIDER_PRIORITY` supports `grok`, `tavily`, and `exa`; configured lists disable omitted providers.
 
 ## `web_fetch`
 
@@ -48,7 +49,7 @@ Specialized fetch paths:
 - arXiv abstract pages.
 - Wikipedia pages.
 
-When `GROK_SEARCH_ALLOW_INTERNAL_FETCH` is false, generic fetch uses Tavily first, Firecrawl second, Exa MCP free-plan third, then plain HTTP with HTML cleanup. If internal fetch is enabled, it skips the external-extractor chain and goes straight to plain HTTP after the specialized fetchers.
+When `GROK_SEARCH_ALLOW_INTERNAL_FETCH` is false, generic fetch uses the configured fetch provider priority; the default is Tavily first, Firecrawl second, Exa MCP free-plan third, then plain HTTP with HTML cleanup. If internal fetch is enabled, it skips the external-extractor chain and goes straight to plain HTTP after the specialized fetchers. Providers omitted from `FETCH_PROVIDER_PRIORITY` are disabled.
 
 ## `get_sources`
 
