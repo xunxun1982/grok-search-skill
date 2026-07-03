@@ -1,7 +1,7 @@
 interface:
-  display_name: "Web Research Direct"
+  display_name: "Web Search Skill"
   short_description: "Direct web search and URL fetching"
-  default_prompt: "Use $web-research-direct to research a current topic with cited sources."
+  default_prompt: "Use $web-search-skill to research a current topic with cited sources."
 
 policy:
   allow_implicit_invocation: true

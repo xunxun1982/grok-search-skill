@@ -27,4 +27,4 @@ GROK_SEARCH_ALLOW_INTERNAL_FETCH = false
 GROK_SEARCH_RESPONSE_MAX_CHARS = 60000
 # By default, search sessions are cached under the system temp directory.
 # Set this only if you explicitly want a persistent cache.
-# SEARCH_CACHE_DIR = "D:\\Temp\\grok-search-skill\\cache"
+# SEARCH_CACHE_DIR = "D:\\Temp\\web-search-skill\\cache"

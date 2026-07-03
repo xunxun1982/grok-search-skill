@@ -26,7 +26,7 @@ except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
 
-USER_AGENT = "web-research-direct-skill/1.0"
+USER_AGENT = "web-search-skill/1.0"
 SUPPORTED_ENV_NAMES = [
     "GROK_SEARCH_API_KEY",
     "GROK_SEARCH_URL",
@@ -118,7 +118,7 @@ def normalize_v1_base(url: str) -> str:
 def default_cache_dir(explicit: str = "") -> Path:
     if explicit:
         return Path(explicit).expanduser()
-    return Path(tempfile.gettempdir()) / "grok-search-skill" / "cache"
+    return Path(tempfile.gettempdir()) / "web-search-skill" / "cache"
 
 
 def skill_dir() -> Path:
@@ -146,12 +146,12 @@ def user_config_candidates() -> list[Path]:
     paths: list[Path] = []
     userprofile = os.environ.get("USERPROFILE")
     if userprofile:
-        paths.append(Path(userprofile) / ".config" / "grok-search-skill" / "config.toml")
+        paths.append(Path(userprofile) / ".config" / "web-search-skill" / "config.toml")
     home = os.environ.get("HOME")
     if home:
-        paths.append(Path(home) / ".config" / "grok-search-skill" / "config.toml")
+        paths.append(Path(home) / ".config" / "web-search-skill" / "config.toml")
     else:
-        paths.append(Path.home() / ".config" / "grok-search-skill" / "config.toml")
+        paths.append(Path.home() / ".config" / "web-search-skill" / "config.toml")
     return dedupe_paths(paths)
 
 

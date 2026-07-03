@@ -1,9 +1,9 @@
 ---
-name: web-research-direct
+name: web-search-skill
 description: Use when Codex needs live web research, URL fetching, source review, site URL discovery, or connectivity diagnosis by running the bundled direct HTTP research script.
 ---
 
-# Web Research Direct
+# Web Search Skill
 
 ## Core Rule
 
@@ -27,7 +27,7 @@ python scripts/groksearch.py <command> [options]
 | Discover URLs under a site | `web_map` |
 | Check configuration and upstream reachability | `doctor` |
 
-These command names intentionally match GrokSearch-rs tools: `web_search`, `get_sources`, `web_fetch`, `web_map`, and `doctor`.
+These command names are the stable Web Search Skill CLI interface: `web_search`, `get_sources`, `web_fetch`, `web_map`, and `doctor`.
 
 Read `references/tools-and-best-practices.md` for command options and output handling. Read `references/configuration.md` before configuring keys, endpoints, cache paths, or provider behavior.
 
@@ -55,7 +55,7 @@ Read `references/tools-and-best-practices.md` for command options and output han
 - `doctor` reports `config_files` with path priority and `exists` flags; use that before assuming configuration is missing.
 - Empty or partially filled upstream objects are ignored.
 - `GROK_SEARCH_ALLOW_INTERNAL_FETCH` defaults to `false`; set it to `true` only when `web_fetch` or `web_map` must read private/internal `http(s)` URLs. Provider endpoints may use private gateways independently.
-- Persistent local secrets should prefer the platform-appropriate user config path (`%USERPROFILE%\.config\grok-search-skill\config.toml` on Windows, `$HOME/.config/grok-search-skill/config.toml` on macOS/Linux) so skill updates do not overwrite them.
+- Persistent local secrets should prefer the platform-appropriate user config path (`%USERPROFILE%\.config\web-search-skill\config.toml` on Windows, `$HOME/.config/web-search-skill/config.toml` on macOS/Linux) so skill updates do not overwrite them.
 - `WEB_RESEARCH_CONFIG` is a lowest-priority fallback config path in this skill, not an override; non-`.toml` paths are ignored.
 
 ## Success Criteria
@@ -64,4 +64,4 @@ Read `references/tools-and-best-practices.md` for command options and output han
 - Important claims have source URLs.
 - Large source sets are recovered via `get_sources` or targeted `web_fetch`, not repeated broad searches.
 - Configuration failures are reported with redacted diagnostics only.
-- Commands used in instructions and reports use the GrokSearch-rs-compatible names.
+- Commands used in instructions and reports use the documented Web Search Skill command names.

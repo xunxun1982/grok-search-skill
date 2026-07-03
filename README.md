@@ -1,14 +1,14 @@
-# Web Research Direct Skill
+# Web Search Skill
 
-Self-contained Codex skill for live search, URL fetching, source review, site URL discovery, and diagnostics through bundled code.
+Self-contained Codex skill for live web search, URL fetching, source review, site URL discovery, and diagnostics through bundled code.
 
 ## Files
 
-- `SKILL.md`：agent-facing workflow and routing rules.
-- `scripts/groksearch.py`：direct HTTP implementation.
-- `references/configuration.md`：environment variables and optional config file.
-- `references/tools-and-best-practices.md`：commands, options, and safety rules.
-- `agents/openai.yaml`：UI metadata.
+- `SKILL.md`: agent-facing workflow and routing rules.
+- `scripts/groksearch.py`: direct HTTP implementation.
+- `references/configuration.md`: environment variables and optional config file.
+- `references/tools-and-best-practices.md`: commands, options, and safety rules.
+- `agents/openai.yaml`: UI metadata.
 
 ## Configuration
 
@@ -16,8 +16,8 @@ For persistent local config, copy `config.example.toml` to the platform user con
 
 Configuration is merged per key in this order. Earlier sources win for keys they define:
 
-1. `%USERPROFILE%\.config\grok-search-skill\config.toml`
-2. `$HOME/.config/grok-search-skill/config.toml`
+1. `%USERPROFILE%\.config\web-search-skill\config.toml`
+2. `$HOME/.config/web-search-skill/config.toml`
 3. Environment variables.
 4. `config.toml` in this skill directory.
 5. TOML file pointed to by `WEB_RESEARCH_CONFIG`
@@ -33,7 +33,7 @@ Important details:
 - `GROK_SEARCH_MAX_RETRIES` controls additional Grok `web_search` retries after the first failed attempt. Any Grok error triggers retry; after retries are exhausted, Tavily is used as fallback when configured.
 - `web_search --grok-max-retries` is a per-call override. If omitted, the merged config value is used.
 - `WEB_RESEARCH_CONFIG` is a fallback config path in the current implementation. It does not override standard user config files, environment variables, or skill-local config, and non-`.toml` paths are ignored.
-- The recommended place for persistent local secrets is the platform-appropriate user config path (`%USERPROFILE%\.config\grok-search-skill\config.toml` on Windows, `$HOME/.config/grok-search-skill/config.toml` on macOS/Linux); this survives skill updates better than a skill-local `config.toml`.
+- The recommended place for persistent local secrets is the platform-appropriate user config path (`%USERPROFILE%\.config\web-search-skill\config.toml` on Windows, `$HOME/.config/web-search-skill/config.toml` on macOS/Linux); this survives skill updates better than a skill-local `config.toml`.
 - `GROK_SEARCH_*` upstreams are called through OpenAI-compatible `/v1/chat/completions`. `doctor` reports the normalized AI `api_url`, not a full request endpoint.
 - Empty scalar values are treated as missing; leave optional scalar settings commented out when unused.
 - `doctor` also reports `config_files` with each config path's priority, source, and existence flag.
@@ -81,8 +81,8 @@ GROK_SEARCH_ALLOW_INTERNAL_FETCH = false
 
 User and fallback config file locations:
 
-- `%USERPROFILE%\.config\grok-search-skill\config.toml`
-- `$HOME/.config/grok-search-skill/config.toml`
+- `%USERPROFILE%\.config\web-search-skill\config.toml`
+- `$HOME/.config/web-search-skill/config.toml`
 - TOML path from `WEB_RESEARCH_CONFIG` (must end with `.toml`)
 
 ## Usage

@@ -2,8 +2,8 @@
 
 The bundled script merges configuration per key by priority. Earlier sources win for keys they define:
 
-1. `%USERPROFILE%\.config\grok-search-skill\config.toml`
-2. `$HOME/.config/grok-search-skill/config.toml`
+1. `%USERPROFILE%\.config\web-search-skill\config.toml`
+2. `$HOME/.config/web-search-skill/config.toml`
 3. Environment variables
 4. Skill directory `config.toml`
 5. TOML file pointed to by `WEB_RESEARCH_CONFIG`
@@ -21,8 +21,8 @@ User config files are preferred so settings and secrets survive skill updates. C
 
 User and fallback locations:
 
-- Windows: `%USERPROFILE%\.config\grok-search-skill\config.toml`
-- macOS / Linux: `$HOME/.config/grok-search-skill/config.toml`
+- Windows: `%USERPROFILE%\.config\web-search-skill\config.toml`
+- macOS / Linux: `$HOME/.config/web-search-skill/config.toml`
 - Extra fallback TOML path: `WEB_RESEARCH_CONFIG` (must end with `.toml`)
 
 TOML example:
