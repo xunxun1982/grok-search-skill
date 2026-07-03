@@ -48,7 +48,7 @@ Specialized fetch paths:
 - arXiv abstract pages.
 - Wikipedia pages.
 
-Generic fetch uses Tavily first, Firecrawl second, Exa MCP free-plan third, then plain HTTP with HTML cleanup.
+When `GROK_SEARCH_ALLOW_INTERNAL_FETCH` is false, generic fetch uses Tavily first, Firecrawl second, Exa MCP free-plan third, then plain HTTP with HTML cleanup. If internal fetch is enabled, it skips the external-extractor chain and goes straight to plain HTTP after the specialized fetchers.
 
 ## `get_sources`
 

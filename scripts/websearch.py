@@ -530,6 +530,7 @@ def exa_mcp_post(endpoint: str, payload: dict[str, Any], cfg: Config, session_id
         "User-Agent": USER_AGENT,
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
+        "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
     }
     if session_id:
         headers["Mcp-Session-Id"] = session_id
@@ -868,7 +869,7 @@ def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
     for url in find_urls({"text": text}):
         if url not in seen:
             seen.add(url)
-            sources.append({"title": url, "url": url, "content": text, "score": None, "published_date": None, "provider": "exa"})
+            sources.append({"title": url, "url": url, "content": "", "score": None, "published_date": None, "provider": "exa"})
     return sources
 
 
@@ -1393,7 +1394,7 @@ def command_map(args: argparse.Namespace, cfg: Config) -> None:
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"Exa map failed: {exc}")
     if urls is None:
-        raise SystemExit("TAVILY_API_KEY is required for Tavily map; Exa MCP fallback is unavailable")
+        raise SystemExit("Map failed: " + ("; ".join(warnings) or "no map provider is configured"))
     page = urls[: args.max_results]
     print(json.dumps({"url": args.url, "urls": page, "count": len(page), "source_type": source_type, "warnings": warnings}, indent=2))
 
