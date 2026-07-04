@@ -26,7 +26,7 @@ except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
 
-USER_AGENT = "web-research-direct-skill/1.0"
+USER_AGENT = "web-search-skill/1.0"
 SUPPORTED_ENV_NAMES = [
     "GROK_SEARCH_API_KEY",
     "GROK_SEARCH_URL",
@@ -39,11 +39,34 @@ SUPPORTED_ENV_NAMES = [
     "GITHUB_TOKEN",
     "GROK_SEARCH_TIMEOUT_SECONDS",
     "GROK_SEARCH_MAX_RETRIES",
+    "SEARCH_PROVIDER_PRIORITY",
+    "FETCH_PROVIDER_PRIORITY",
+    "MAP_PROVIDER_PRIORITY",
     "SEARCH_CACHE_DIR",
     "GROK_SEARCH_FETCH_MAX_CHARS",
     "GROK_SEARCH_ALLOW_INTERNAL_FETCH",
     "GROK_SEARCH_RESPONSE_MAX_CHARS",
 ]
+APP_DIR_NAME = "web-search-skill"
+EXA_MCP_URL = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa"
+MCP_PROTOCOL_VERSION = "2025-11-25"
+DEFAULT_SEARCH_PROVIDER_PRIORITY = ["grok", "tavily", "exa"]
+DEFAULT_FETCH_PROVIDER_PRIORITY = ["tavily", "firecrawl", "exa", "plain"]
+DEFAULT_MAP_PROVIDER_PRIORITY = ["tavily", "exa"]
+CONFIG_SOURCE_META_KEY = "__config_source"
+PROVIDER_ALIASES = {
+    "ai": "grok",
+    "search": "grok",
+    "grok-search": "grok",
+    "plain-http": "plain",
+}
+PROVIDER_LABELS = {
+    "grok": "Grok",
+    "tavily": "Tavily",
+    "firecrawl": "Firecrawl",
+    "exa": "Exa",
+    "plain": "plain HTTP",
+}
 
 UPSTREAM_DEFAULTS = {
     "grok_search": {
@@ -87,6 +110,12 @@ def strip_html(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def non_blank_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value if value.strip() else None
+
+
 def normalize_base(url: str, suffix: str) -> str:
     base = (url or "").strip().rstrip("/")
     if not base:
@@ -118,7 +147,7 @@ def normalize_v1_base(url: str) -> str:
 def default_cache_dir(explicit: str = "") -> Path:
     if explicit:
         return Path(explicit).expanduser()
-    return Path(tempfile.gettempdir()) / "grok-search-skill" / "cache"
+    return Path(tempfile.gettempdir()) / APP_DIR_NAME / "cache"
 
 
 def skill_dir() -> Path:
@@ -146,12 +175,12 @@ def user_config_candidates() -> list[Path]:
     paths: list[Path] = []
     userprofile = os.environ.get("USERPROFILE")
     if userprofile:
-        paths.append(Path(userprofile) / ".config" / "grok-search-skill" / "config.toml")
+        paths.append(Path(userprofile) / ".config" / APP_DIR_NAME / "config.toml")
     home = os.environ.get("HOME")
     if home:
-        paths.append(Path(home) / ".config" / "grok-search-skill" / "config.toml")
+        paths.append(Path(home) / ".config" / APP_DIR_NAME / "config.toml")
     else:
-        paths.append(Path.home() / ".config" / "grok-search-skill" / "config.toml")
+        paths.append(Path.home() / ".config" / APP_DIR_NAME / "config.toml")
     return dedupe_paths(paths)
 
 
@@ -212,11 +241,13 @@ def read_config_file(path: Path) -> dict[str, Any]:
 def config_value_is_effective(key: str, value: Any) -> bool:
     if isinstance(value, str):
         return bool(value.strip())
+    if key.endswith("_provider_priority") and isinstance(value, list):
+        return True
     if key.endswith("_upstreams") and isinstance(value, list):
         provider = key[: -len("_upstreams")]
         return any(
             isinstance(raw, dict)
-            and has_required_upstream_values(provider, {**UPSTREAM_DEFAULTS.get(provider, {}), **lower_keys(raw)})
+            and has_required_upstream_values(provider, lower_keys(raw))
             for raw in value
         )
     return True
@@ -229,6 +260,10 @@ def merge_missing(target: dict[str, Any], source: dict[str, Any]) -> None:
         target.setdefault(key, value)
 
 
+def effective_config_values(source: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in lower_keys(source).items() if config_value_is_effective(key, value)}
+
+
 def env_config_values() -> dict[str, str]:
     return {name.lower(): os.environ[name] for name in SUPPORTED_ENV_NAMES if name in os.environ}
 
@@ -238,22 +273,36 @@ def env_presence() -> dict[str, bool]:
     return {name: name in os.environ for name in names}
 
 
-def load_file_config() -> dict[str, Any]:
-    merged: dict[str, Any] = {}
+def load_file_config_with_source() -> tuple[dict[str, Any], dict[str, str]]:
     for path in user_config_candidates():
         if not path.exists():
             continue
-        merge_missing(merged, read_config_file(path))
-    merge_missing(merged, env_config_values())
+        values = effective_config_values(read_config_file(path))
+        if values:
+            return values, {"source": "user", "path": str(path)}
+    values = effective_config_values(env_config_values())
+    if values:
+        return values, {"source": "environment", "path": ""}
     for path in skill_config_candidates():
         if not path.exists():
             continue
-        merge_missing(merged, read_config_file(path))
+        values = effective_config_values(read_config_file(path))
+        if values:
+            return values, {"source": "skill-local", "path": str(path)}
     for path in fallback_config_candidates():
         if not path.exists():
             continue
-        merge_missing(merged, read_config_file(path))
-    return merged
+        values = effective_config_values(read_config_file(path))
+        if values:
+            return values, {"source": "fallback", "path": str(path)}
+    return {}, {"source": "defaults", "path": ""}
+
+
+def load_file_config() -> dict[str, Any]:
+    values, source = load_file_config_with_source()
+    if source["source"] != "defaults":
+        values[CONFIG_SOURCE_META_KEY] = source
+    return values
 
 
 def lower_keys(data: dict[str, Any]) -> dict[str, Any]:
@@ -261,7 +310,10 @@ def lower_keys(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def has_required_upstream_values(provider: str, upstream: dict[str, Any]) -> bool:
-    return all(str(upstream.get(key, "")).strip() for key in UPSTREAM_REQUIRED_KEYS.get(provider, ()))
+    required = UPSTREAM_REQUIRED_KEYS.get(provider)
+    if not required:
+        return False
+    return all(str(upstream.get(key, "")).strip() for key in required)
 
 
 def random_upstream(cfg: "Config", provider: str) -> dict[str, str] | None:
@@ -274,8 +326,10 @@ def random_upstream(cfg: "Config", provider: str) -> dict[str, str] | None:
         for raw in raw_upstreams:
             if not isinstance(raw, dict):
                 continue
-            item = {**defaults, **lower_keys(raw)}
-            if has_required_upstream_values(provider, item):
+            raw_item = lower_keys(raw)
+            # Array entries must be complete before defaults are merged; defaults only support scalar fallback config.
+            if has_required_upstream_values(provider, raw_item):
+                item = {**defaults, **raw_item}
                 upstreams.append({str(k): str(v) for k, v in item.items()})
 
     if upstreams:
@@ -299,10 +353,30 @@ def complete_upstream_count(cfg: "Config", provider: str) -> int:
         return sum(
             1
             for raw in raw_upstreams
-            if isinstance(raw, dict)
-            and has_required_upstream_values(provider, {**UPSTREAM_DEFAULTS.get(provider, {}), **lower_keys(raw)})
+            if isinstance(raw, dict) and has_required_upstream_values(provider, lower_keys(raw))
         )
     return int(random_upstream(cfg, provider) is not None)
+
+
+def provider_priority(cfg: "Config", env_name: str, default: list[str]) -> list[str]:
+    raw = cfg.file_values.get(env_name.lower())
+    if raw is None:
+        return list(default)
+    values: list[Any] = []
+    if isinstance(raw, list):
+        values = raw
+    elif isinstance(raw, str):
+        values = raw.split(",")
+    elif raw is not None:
+        values = [raw]
+
+    allowed = set(default)
+    result: list[str] = []
+    for value in values:
+        normalized = PROVIDER_ALIASES.get(str(value).strip().lower(), str(value).strip().lower())
+        if normalized in allowed and normalized not in result:
+            result.append(normalized)
+    return result
 
 
 @dataclasses.dataclass
@@ -472,6 +546,155 @@ def bearer_headers(key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 
+def parse_sse_json_messages(text: str) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    data_lines: list[str] = []
+
+    def flush_data() -> None:
+        if not data_lines:
+            return
+        raw = "\n".join(data_lines).strip()
+        data_lines.clear()
+        if not raw:
+            return
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if isinstance(value, dict):
+            messages.append(value)
+
+    for line in text.splitlines():
+        if not line.strip():
+            flush_data()
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    flush_data()
+
+    if not messages:
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(value, dict):
+            messages.append(value)
+    return messages
+
+
+def first_jsonrpc_message(text: str, request_id: int) -> dict[str, Any]:
+    for message in parse_sse_json_messages(text):
+        if message.get("id") == request_id:
+            return message
+    messages = parse_sse_json_messages(text)
+    if messages:
+        return messages[0]
+    raise HttpError(0, "MCP server returned no JSON-RPC message")
+
+
+def exa_mcp_post(endpoint: str, payload: dict[str, Any], cfg: Config, session_id: str = "") -> tuple[str, str]:
+    validate_web_url(endpoint, allow_internal=False, timeout=cfg.timeout)
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+    }
+    if session_id:
+        headers["Mcp-Session-Id"] = session_id
+    req = urllib.request.Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+    try:
+        opener = urllib.request.build_opener(PublicRedirectHandler(cfg.timeout, allow_internal=False))
+        with opener.open(req, timeout=cfg.timeout) as resp:
+            return resp.headers.get("Mcp-Session-Id") or "", resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        error_text = exc.read().decode("utf-8", errors="replace")
+        raise HttpError(exc.code, error_text[:2000]) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise HttpError(0, f"network failure: {exc}") from exc
+
+
+def exa_mcp_tool_call(endpoint: str, tool_name: str, arguments: dict[str, Any], cfg: Config) -> str:
+    # This is only the MCP transport wrapper; callers must handle each tool's
+    # coverage semantics, such as Exa map using ranked search instead of crawl.
+    session_id, init_text = exa_mcp_post(
+        endpoint,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": APP_DIR_NAME, "version": "1.0"},
+            },
+        },
+        cfg,
+    )
+    init_message = first_jsonrpc_message(init_text, 1)
+    if init_message.get("error"):
+        raise HttpError(0, json.dumps(init_message["error"], ensure_ascii=False))
+    if not session_id:
+        raise HttpError(0, "MCP server did not return a session id")
+    exa_mcp_post(
+        endpoint,
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        cfg,
+        session_id=session_id,
+    )
+    call_id = 2
+    _, call_text = exa_mcp_post(
+        endpoint,
+        {
+            "jsonrpc": "2.0",
+            "id": call_id,
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments},
+        },
+        cfg,
+        session_id=session_id,
+    )
+    message = first_jsonrpc_message(call_text, call_id)
+    if message.get("error"):
+        raise HttpError(0, json.dumps(message["error"], ensure_ascii=False))
+    result = message.get("result")
+    if not isinstance(result, dict):
+        return ""
+    content = result.get("content")
+    parts: list[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+    text = "\n".join(part for part in parts if part)
+    if result.get("isError"):
+        raise HttpError(0, text or "Exa MCP tool returned an error")
+    return text
+
+
+def search_result_status(result: dict[str, Any] | None) -> str:
+    if result is None:
+        return "not configured"
+    if result.get("answer") or result.get("sources") or result.get("urls"):
+        return ""
+    return "returned no usable results"
+
+
+def fallback_warning(provider: str, status: str, next_provider: str = "") -> str:
+    label = PROVIDER_LABELS.get(provider, provider)
+    if next_provider:
+        next_label = PROVIDER_LABELS.get(next_provider, next_provider)
+        return f"{label} {status}; using {next_label} fallback."
+    return f"{label} {status}."
+
+
+def clean_found_url(url: str) -> str:
+    clean = url.strip()
+    for marker in ("\\n", "\\t", "\\", "`", "<"):
+        clean = clean.split(marker, 1)[0]
+    return clean.rstrip(".,;*)]}")
+
+
 def find_urls(obj: Any) -> list[str]:
     found: list[str] = []
 
@@ -485,13 +708,13 @@ def find_urls(obj: Any) -> list[str]:
             for item in value:
                 walk(item)
         elif isinstance(value, str):
-            found.extend(re.findall(r"https?://[^\s\[\])>\"']+", value))
+            found.extend(re.findall(r"https?://[^\s\[\])>`\"']+", value))
 
     walk(obj)
     deduped: list[str] = []
     seen: set[str] = set()
     for url in found:
-        clean = url.rstrip(".,;*")
+        clean = clean_found_url(url)
         if clean not in seen:
             seen.add(clean)
             deduped.append(clean)
@@ -636,6 +859,136 @@ def tavily_search(
     }
 
 
+def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("results"), list):
+        sources: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in data["results"]:
+            if not isinstance(item, dict):
+                continue
+            url = clean_found_url(str(item.get("url") or ""))
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            content = ""
+            if isinstance(item.get("text"), str):
+                content = item["text"]
+            elif isinstance(item.get("highlights"), list):
+                content = "\n".join(part for part in item["highlights"] if isinstance(part, str))
+            elif isinstance(item.get("summary"), str):
+                content = item["summary"]
+            title = str(item.get("title") or url)
+            block = "\n".join(part for part in [f"Title: {title}", f"URL: {url}", content] if part).strip()
+            sources.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "content": block,
+                    "score": None,
+                    "published_date": item.get("publishedDate"),
+                    "provider": "exa",
+                }
+            )
+        return sources
+
+    sources: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    current_title = ""
+    current_url = ""
+    current_lines: list[str] = []
+
+    def flush_current() -> None:
+        nonlocal current_title, current_url, current_lines
+        if not current_url or current_url in seen:
+            current_title = ""
+            current_url = ""
+            current_lines = []
+            return
+        seen.add(current_url)
+        block = "\n".join(current_lines).strip()
+        published_match = re.search(r"(?m)^Published:\s*(.+)$", block)
+        sources.append(
+            {
+                "title": current_title or current_url,
+                "url": current_url,
+                "content": block,
+                "score": None,
+                "published_date": published_match.group(1).strip() if published_match else None,
+                "provider": "exa",
+            }
+        )
+        current_title = ""
+        current_url = ""
+        current_lines = []
+
+    for line in text.splitlines():
+        title_match = re.match(r"^Title:\s*(.+)$", line)
+        if title_match:
+            flush_current()
+            current_title = title_match.group(1).strip()
+            current_lines = [line]
+            continue
+        if not current_lines:
+            continue
+        current_lines.append(line)
+        if not current_url:
+            url_match = re.match(r"^URL:\s*(\S+)", line)
+            if url_match:
+                current_url = clean_found_url(url_match.group(1))
+    flush_current()
+
+    if sources:
+        return sources
+    for url in find_urls({"text": text}):
+        if url not in seen:
+            seen.add(url)
+            sources.append({"title": url, "url": url, "content": "", "score": None, "published_date": None, "provider": "exa"})
+    return sources
+
+
+def exa_search(
+    cfg: Config,
+    query: str,
+    *,
+    max_sources: int,
+    detailed: bool,
+    include_domains: list[str],
+    exclude_domains: list[str],
+    recency_days: int | None,
+) -> dict[str, Any] | None:
+    tool_name = "web_search_exa"
+    payload: dict[str, Any] = {"query": query, "numResults": max_sources}
+    use_advanced = detailed or bool(include_domains or exclude_domains or recency_days)
+    if use_advanced:
+        tool_name = "web_search_advanced_exa"
+        payload["type"] = "auto"
+        if detailed:
+            payload["textMaxCharacters"] = 5000
+        else:
+            payload["enableHighlights"] = True
+    if include_domains:
+        payload["includeDomains"] = include_domains
+    if exclude_domains:
+        payload["excludeDomains"] = exclude_domains
+    if recency_days:
+        start = int(time.time()) - recency_days * 86400
+        payload["startPublishedDate"] = time.strftime("%Y-%m-%d", time.gmtime(start))
+    text = exa_mcp_tool_call(EXA_MCP_URL, tool_name, payload, cfg)
+    sources = exa_sources_from_mcp_text(text)
+    if text.lstrip().startswith("{") and sources:
+        text = "\n\n---\n\n".join(str(item.get("content") or "") for item in sources if item.get("content"))
+    return {
+        "answer": text,
+        "sources": sources,
+        "provider": "exa",
+    }
+
+
 def save_session(cfg: Config, payload: dict[str, Any]) -> str:
     session_id = uuid.uuid4().hex[:16]
     cfg.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -661,41 +1014,84 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
     warnings: list[str] = []
     ai_result: dict[str, Any] | None = None
     tavily_result: dict[str, Any] | None = None
-    ai_failed = False
+    exa_result: dict[str, Any] | None = None
+    priority = provider_priority(cfg, "SEARCH_PROVIDER_PRIORITY", DEFAULT_SEARCH_PROVIDER_PRIORITY)
+    if not priority:
+        warnings.append("No search provider is enabled.")
 
-    for attempt in range(max_retries + 1):
-        try:
-            ai_result = ai_search(cfg, args.query)
-            if ai_result is None:
-                ai_failed = True
-                warnings.append("AI provider not configured; using Tavily fallback.")
+    for index, provider in enumerate(priority):
+        next_provider = priority[index + 1] if index + 1 < len(priority) else ""
+        if provider == "grok":
+            grok_status = "unavailable"
+            for attempt in range(max_retries + 1):
+                try:
+                    ai_result = ai_search(cfg, args.query)
+                    grok_status = search_result_status(ai_result)
+                    if grok_status == "not configured":
+                        warnings.append("AI provider not configured; using search fallbacks.")
+                    elif grok_status:
+                        warnings.append(fallback_warning(provider, grok_status, next_provider))
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    error_type = "timed out" if is_timeout_error(exc) else "failed"
+                    warnings.append(f"AI provider attempt {attempt + 1}/{max_retries + 1} {error_type}: {exc}")
+            else:
+                warnings.append(fallback_warning(provider, grok_status, next_provider))
+            if not grok_status:
                 break
-            ai_failed = False
-            break
-        except Exception as exc:  # noqa: BLE001
-            ai_failed = True
-            error_type = "timed out" if is_timeout_error(exc) else "failed"
-            warnings.append(f"AI provider attempt {attempt + 1}/{max_retries + 1} {error_type}: {exc}")
+            ai_result = None
+            continue
 
-    if ai_failed:
-        try:
-            tavily_result = tavily_search(
-                cfg,
-                args.query,
-                max_sources=args.max_sources,
-                detailed=detailed,
-                include_domains=args.include_domain,
-                exclude_domains=args.exclude_domain,
-                recency_days=args.recency_days,
-            )
-        except Exception as exc:  # noqa: BLE001
-            warnings.append(f"Tavily failed: {exc}")
+        if provider == "tavily":
+            try:
+                tavily_result = tavily_search(
+                    cfg,
+                    args.query,
+                    max_sources=args.max_sources,
+                    detailed=detailed,
+                    include_domains=args.include_domain,
+                    exclude_domains=args.exclude_domain,
+                    recency_days=args.recency_days,
+                )
+            except Exception as exc:  # noqa: BLE001
+                tavily_result = None
+                warnings.append(f"Tavily failed: {exc}")
+                continue
+            tavily_status = search_result_status(tavily_result)
+            if not tavily_status:
+                break
+            warnings.append(fallback_warning(provider, tavily_status, next_provider))
+            tavily_result = None
+            continue
+
+        if provider == "exa":
+            try:
+                exa_result = exa_search(
+                    cfg,
+                    args.query,
+                    max_sources=args.max_sources,
+                    detailed=detailed,
+                    include_domains=args.include_domain,
+                    exclude_domains=args.exclude_domain,
+                    recency_days=args.recency_days,
+                )
+            except Exception as exc:  # noqa: BLE001
+                exa_result = None
+                warnings.append(f"Exa failed: {exc}")
+                continue
+            exa_status = search_result_status(exa_result)
+            if not exa_status:
+                break
+            warnings.append(fallback_warning(provider, exa_status, next_provider))
+            exa_result = None
 
     answer_parts: list[str] = []
     if ai_result and ai_result.get("answer"):
         answer_parts.append(str(ai_result["answer"]).strip())
     if tavily_result and tavily_result.get("answer"):
         answer_parts.append(str(tavily_result["answer"]).strip())
+    if exa_result and exa_result.get("answer"):
+        answer_parts.append(str(exa_result["answer"]).strip())
     answer = "\n\n".join(part for part in answer_parts if part) or "No answer text returned."
 
     sources: list[dict[str, Any]] = []
@@ -707,6 +1103,12 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
                 sources.append({"title": url, "url": url, "provider": "ai"})
     if tavily_result:
         for item in tavily_result.get("sources", []):
+            url = item.get("url")
+            if url and url not in seen:
+                seen.add(url)
+                sources.append(item)
+    if exa_result:
+        for item in exa_result.get("sources", []):
             url = item.get("url")
             if url and url not in seen:
                 seen.add(url)
@@ -893,7 +1295,7 @@ def tavily_extract(url: str, cfg: Config) -> str | None:
     if isinstance(results, list) and results:
         first = results[0]
         if isinstance(first, dict):
-            return first.get("raw_content") or first.get("content")
+            return non_blank_text(first.get("raw_content")) or non_blank_text(first.get("content"))
     return None
 
 
@@ -915,7 +1317,78 @@ def firecrawl_extract(url: str, cfg: Config) -> str | None:
         allow_internal=True,
     )
     payload = data.get("data") if isinstance(data.get("data"), dict) else data
-    return payload.get("markdown") or payload.get("content")
+    return non_blank_text(payload.get("markdown")) or non_blank_text(payload.get("content"))
+
+
+def exa_extract(url: str, cfg: Config) -> str | None:
+    return non_blank_text(exa_mcp_tool_call(EXA_MCP_URL, "web_fetch_exa", {"urls": [url]}, cfg))
+
+
+def tavily_map(url: str, cfg: Config, max_results: int) -> list[str] | None:
+    upstream = random_upstream(cfg, "tavily")
+    if not upstream or not upstream.get("tavily_api_key"):
+        return None
+    endpoint = upstream.get("tavily_api_url", "https://api.tavily.com").rstrip("/") + "/map"
+    payload = {"url": url, "max_results": max_results}
+    data = request_json(
+        "POST",
+        endpoint,
+        headers=bearer_headers(upstream["tavily_api_key"]),
+        payload=payload,
+        timeout=cfg.timeout,
+        allow_internal=True,
+    )
+    raw_results = data.get("results") or data.get("urls") or []
+    urls: list[str] = []
+    if isinstance(raw_results, list):
+        for item in raw_results:
+            if isinstance(item, str):
+                urls.append(item)
+            elif isinstance(item, dict) and item.get("url"):
+                urls.append(str(item["url"]))
+    return urls
+
+
+def exa_map(url: str, cfg: Config, max_results: int) -> list[str] | None:
+    """Return a best-effort URL map from Exa's ranked semantic search results."""
+    parsed = urllib.parse.urlparse(url)
+    # Exa MCP has no dedicated sitemap/crawl tool here; this is a best-effort
+    # map fallback based on web_search_advanced_exa ranking, not exhaustive discovery.
+    query = f"pages under {url}"
+    payload: dict[str, Any] = {"query": query, "numResults": max_results}
+    if parsed.hostname:
+        payload["includeDomains"] = [parsed.hostname]
+    text = exa_mcp_tool_call(EXA_MCP_URL, "web_search_advanced_exa", payload, cfg)
+    urls = [item["url"] for item in exa_sources_from_mcp_text(text)]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    target_host = (parsed.hostname or "").lower()
+    skipped_suffixes = (
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".svg",
+        ".ico",
+        ".css",
+        ".js",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".map",
+    )
+    for item in urls:
+        parsed_item = urllib.parse.urlparse(item)
+        item_host = (parsed_item.hostname or "").lower()
+        if target_host and item_host != target_host and not item_host.endswith("." + target_host):
+            continue
+        if parsed_item.path.lower().endswith(skipped_suffixes):
+            continue
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    return deduped
 
 
 def plain_fetch(url: str, cfg: Config, *, allow_internal: bool = False) -> str:
@@ -930,6 +1403,7 @@ def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
     source_type = "generic"
     content: str | None = None
     use_external_extract = not cfg.allow_internal_fetch
+    fetch_priority = provider_priority(cfg, "FETCH_PROVIDER_PRIORITY", DEFAULT_FETCH_PROVIDER_PRIORITY)
 
     for name, fetcher in [
         ("github", github_fetch),
@@ -946,7 +1420,15 @@ def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
             warnings.append(f"{name} specialized fetch failed: {exc}")
 
     if content is None and use_external_extract:
-        for name, fetcher in [("tavily", tavily_extract), ("firecrawl", firecrawl_extract)]:
+        fetchers = {"tavily": tavily_extract, "firecrawl": firecrawl_extract, "exa": exa_extract}
+        for name in fetch_priority:
+            if name == "plain":
+                content = plain_fetch(args.url, cfg, allow_internal=cfg.allow_internal_fetch)
+                source_type = "plain-http"
+                break
+            fetcher = fetchers.get(name)
+            if fetcher is None:
+                continue
             try:
                 content = fetcher(args.url, cfg)
                 if content:
@@ -956,8 +1438,13 @@ def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
                 warnings.append(f"{name} fetch failed: {exc}")
 
     if content is None:
-        content = plain_fetch(args.url, cfg, allow_internal=cfg.allow_internal_fetch)
-        source_type = "plain-http"
+        if not use_external_extract and "plain" in fetch_priority:
+            content = plain_fetch(args.url, cfg, allow_internal=cfg.allow_internal_fetch)
+            source_type = "plain-http"
+        else:
+            content = ""
+            source_type = "none"
+            warnings.append("No enabled fetch provider returned content.")
 
     original_length = len(content)
     content, truncated = clamp_text(content, max_chars or None)
@@ -1003,41 +1490,59 @@ def command_sources(args: argparse.Namespace, cfg: Config) -> None:
 
 def command_map(args: argparse.Namespace, cfg: Config) -> None:
     validate_web_url(args.url, allow_internal=cfg.allow_internal_fetch, timeout=cfg.timeout)
-    upstream = random_upstream(cfg, "tavily")
-    if not upstream or not upstream.get("tavily_api_key"):
-        raise SystemExit("TAVILY_API_KEY is required for map")
-    endpoint = upstream.get("tavily_api_url", "https://api.tavily.com").rstrip("/") + "/map"
-    payload = {"url": args.url, "max_results": args.max_results}
-    data = request_json(
-        "POST",
-        endpoint,
-        headers=bearer_headers(upstream["tavily_api_key"]),
-        payload=payload,
-        timeout=cfg.timeout,
-        allow_internal=True,
-    )
-    raw_results = data.get("results") or data.get("urls") or []
-    urls: list[str] = []
-    if isinstance(raw_results, list):
-        for item in raw_results:
-            if isinstance(item, str):
-                urls.append(item)
-            elif isinstance(item, dict) and item.get("url"):
-                urls.append(str(item["url"]))
-    print(json.dumps({"url": args.url, "urls": urls[: args.max_results], "count": len(urls[: args.max_results])}, indent=2))
+    warnings: list[str] = []
+    urls: list[str] | None = None
+    source_type = ""
+    for name in provider_priority(cfg, "MAP_PROVIDER_PRIORITY", DEFAULT_MAP_PROVIDER_PRIORITY):
+        try:
+            if name == "tavily":
+                urls = tavily_map(args.url, cfg, args.max_results)
+                if urls is None:
+                    warnings.append("Tavily map not configured.")
+                    continue
+            elif name == "exa":
+                urls = exa_map(args.url, cfg, args.max_results)
+            else:
+                continue
+            source_type = name
+            if urls:
+                break
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"{PROVIDER_LABELS.get(name, name)} map failed: {exc}")
+    if urls is None:
+        raise SystemExit("Map failed: " + ("; ".join(warnings) or "no map provider is configured"))
+    page = urls[: args.max_results]
+    print(json.dumps({"url": args.url, "urls": page, "count": len(page), "source_type": source_type, "warnings": warnings}, indent=2))
 
 
 def command_doctor(args: argparse.Namespace, cfg: Config) -> None:
     del args
     cache_dir = cfg.cache_dir
+    search_priority = provider_priority(cfg, "SEARCH_PROVIDER_PRIORITY", DEFAULT_SEARCH_PROVIDER_PRIORITY)
+    fetch_priority = provider_priority(cfg, "FETCH_PROVIDER_PRIORITY", DEFAULT_FETCH_PROVIDER_PRIORITY)
+    map_priority = provider_priority(cfg, "MAP_PROVIDER_PRIORITY", DEFAULT_MAP_PROVIDER_PRIORITY)
+    provider_enabled = {
+        "grok": "grok" in search_priority,
+        "tavily": any("tavily" in priority for priority in (search_priority, fetch_priority, map_priority)),
+        "firecrawl": "firecrawl" in fetch_priority,
+        "exa": any("exa" in priority for priority in (search_priority, fetch_priority, map_priority)),
+        "plain": "plain" in fetch_priority,
+    }
     checks: dict[str, Any] = {
         "config_file_checked": [str(path) for path in config_file_candidates()],
         "config_files": config_file_statuses(),
+        "active_config_source": cfg.file_values.get(CONFIG_SOURCE_META_KEY, {"source": "injected", "path": ""}),
         "cache_dir": str(cache_dir),
         "cache_dir_exists": cache_dir.exists(),
         "grok_search_upstreams": complete_upstream_count(cfg, "grok_search"),
         "tavily_upstreams": complete_upstream_count(cfg, "tavily"),
         "firecrawl_upstreams": complete_upstream_count(cfg, "firecrawl"),
+        "provider_priority": {
+            "search": search_priority,
+            "fetch": fetch_priority,
+            "map": map_priority,
+        },
+        "provider_enabled": provider_enabled,
         "has_github_token": bool(cfg.get("GITHUB_TOKEN")),
         "environment": env_presence(),
     }
@@ -1046,15 +1551,38 @@ def command_doctor(args: argparse.Namespace, cfg: Config) -> None:
     if grok and grok.get("grok_search_api_key"):
         try:
             api_url = normalize_v1_base(grok.get("grok_search_url", "https://api.x.ai"))
-            probes.append({"name": "ai-provider", "api_url": api_url, "configured": True})
+            probes.append({"name": "ai-provider", "api_url": api_url, "configured": True, "enabled": provider_enabled["grok"]})
         except Exception as exc:  # noqa: BLE001
-            probes.append({"name": "ai-provider", "configured": True, "error": str(exc)})
+            probes.append({"name": "ai-provider", "configured": True, "enabled": provider_enabled["grok"], "error": str(exc)})
     tavily = random_upstream(cfg, "tavily")
     if tavily and tavily.get("tavily_api_key"):
-        probes.append({"name": "tavily", "endpoint": tavily.get("tavily_api_url", "https://api.tavily.com"), "configured": True})
+        probes.append(
+            {
+                "name": "tavily",
+                "endpoint": tavily.get("tavily_api_url", "https://api.tavily.com"),
+                "configured": True,
+                "enabled": provider_enabled["tavily"],
+            }
+        )
     firecrawl = random_upstream(cfg, "firecrawl")
     if firecrawl and firecrawl.get("firecrawl_api_key"):
-        probes.append({"name": "firecrawl", "endpoint": firecrawl.get("firecrawl_api_url", "https://api.firecrawl.dev"), "configured": True})
+        probes.append(
+            {
+                "name": "firecrawl",
+                "endpoint": firecrawl.get("firecrawl_api_url", "https://api.firecrawl.dev"),
+                "configured": True,
+                "enabled": provider_enabled["firecrawl"],
+            }
+        )
+    probes.append(
+        {
+            "name": "exa-mcp",
+            "endpoint": EXA_MCP_URL,
+            "configured": True,
+            "enabled": provider_enabled["exa"],
+            "auth": "free-plan-no-key",
+        }
+    )
     checks["probes"] = probes
     print(json.dumps(checks, ensure_ascii=False, indent=2))
 
