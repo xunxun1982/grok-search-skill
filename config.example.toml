@@ -2,10 +2,10 @@
 # Do not commit config.toml with real keys.
 
 # Provider priorities are evaluated in order. Providers omitted from a priority list are disabled.
-# SEARCH_PROVIDER_PRIORITY supports: "grok", "tavily", "exa".
+# SEARCH_PROVIDER_PRIORITY supports: "grok", "tavily", "exa", "duckduckgo".
 # FETCH_PROVIDER_PRIORITY supports: "tavily", "firecrawl", "exa", "plain".
 # MAP_PROVIDER_PRIORITY supports: "tavily", "exa".
-SEARCH_PROVIDER_PRIORITY = ["grok", "tavily", "exa"]
+SEARCH_PROVIDER_PRIORITY = ["grok", "tavily", "exa", "duckduckgo"]
 FETCH_PROVIDER_PRIORITY = ["tavily", "firecrawl", "exa", "plain"]
 MAP_PROVIDER_PRIORITY = ["tavily", "exa"]
 
@@ -26,12 +26,13 @@ FIRECRAWL_UPSTREAMS = [
 ]
 
 # Exa fallback uses the official free-plan MCP endpoint without local key config.
+# DuckDuckGo fallback uses the keyless Instant Answer API.
 
 # Optional non-empty scalar. Raises GitHub issue/PR API limits and supports private repositories.
 # GITHUB_TOKEN = "ghp_..."
 
 GROK_SEARCH_TIMEOUT_SECONDS = 120
-GROK_SEARCH_MAX_RETRIES = 5
+GROK_SEARCH_MAX_RETRIES = 2
 GROK_SEARCH_FETCH_MAX_CHARS = 0
 GROK_SEARCH_ALLOW_INTERNAL_FETCH = false
 GROK_SEARCH_RESPONSE_MAX_CHARS = 60000

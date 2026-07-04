@@ -22,9 +22,10 @@ Useful options:
 - `--include-domain example.com`
 - `--exclude-domain example.com`
 - `--recency-days 7`
+- `--mode general|news|academic`
 - `--max-sources 8`
 - `--max-chars 60000`
-- `--grok-max-retries 5`
+- `--grok-max-retries 2`
 
 Rules:
 
@@ -32,9 +33,10 @@ Rules:
 - Use `--format detailed` only when inline source text is needed.
 - Save the returned `session_id`; use `get_sources` for review instead of repeating the same search.
 - If output is truncated, fetch the important URLs directly with `web_fetch`.
-- Any Grok provider error, including `429`, transport failure, parse failure, and timeout, is retryable. With the default provider priority, after `--grok-max-retries` additional attempts are exhausted, `web_search` uses Tavily fallback when configured, then Exa as the lowest-priority fallback.
+- Any Grok provider error, including `429`, transport failure, parse failure, and timeout, is retryable. With the default provider priority, after `--grok-max-retries` additional attempts are exhausted, `web_search` uses Tavily, Exa, then keyless DuckDuckGo Instant Answer fallback.
+- Use `--mode news` only when recency is part of the request; it uses the same `SEARCH_PROVIDER_PRIORITY` as general search and defaults to a 7-day freshness window unless `--recency-days` is provided. Use `--mode academic` only when paper/study discovery is explicit; it uses the same provider priority and does not guess intent.
 - Omit `--grok-max-retries` to use the configured `GROK_SEARCH_MAX_RETRIES`; pass the flag only when the single call should override config.
-- `SEARCH_PROVIDER_PRIORITY` supports `grok`, `tavily`, and `exa`; configured lists disable omitted providers.
+- `SEARCH_PROVIDER_PRIORITY` supports `grok`, `tavily`, `exa`, and `duckduckgo`; configured lists disable omitted providers. DuckDuckGo uses the keyless Instant Answer API and is not a full SERP provider.
 
 ## `web_fetch`
 
