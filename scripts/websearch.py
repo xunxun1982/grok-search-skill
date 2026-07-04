@@ -238,7 +238,11 @@ def read_config_file(path: Path) -> dict[str, Any]:
     try:
         raw = path.read_bytes()
         if raw.startswith(UTF8_BOM):
-            raw = normalize_utf8_bom_config(path, raw)
+            try:
+                raw = normalize_utf8_bom_config(path, raw)
+            except ConfigError:
+                # On-disk cleanup is best-effort; this load can still parse the normalized bytes.
+                raw = raw[len(UTF8_BOM) :]
         text = raw.decode("utf-8")
         return tomllib.loads(text)
     except OSError as exc:
@@ -765,6 +769,9 @@ def exa_mcp_tool_call(endpoint: str, tool_name: str, arguments: dict[str, Any], 
 def search_result_status(result: dict[str, Any] | None) -> str:
     if result is None:
         return "not configured"
+    skip_reason = result.get("skip_reason")
+    if isinstance(skip_reason, str) and skip_reason:
+        return skip_reason
     if result.get("answer") or result.get("sources") or result.get("urls"):
         return ""
     return "returned no usable results"
@@ -1156,8 +1163,21 @@ def duckduckgo_search(
     search_mode: str = "general",
 ) -> dict[str, Any] | None:
     del detailed, search_mode
-    if include_domains or exclude_domains or recency_days:
-        return None
+    if include_domains or exclude_domains:
+        return {
+            "answer": "",
+            "sources": [],
+            "provider": "duckduckgo",
+            "skip_reason": "does not support domain filters",
+        }
+    if recency_days:
+        # Instant Answer is not a full SERP/news API; keep recency semantics by skipping unfiltered results.
+        return {
+            "answer": "",
+            "sources": [],
+            "provider": "duckduckgo",
+            "skip_reason": "does not support recency filters",
+        }
 
     params = urllib.parse.urlencode(
         {

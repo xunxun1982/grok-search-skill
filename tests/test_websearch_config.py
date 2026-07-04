@@ -73,3 +73,78 @@ class ConfigBomTests(unittest.TestCase):
             self.assertEqual(config_path.read_bytes(), websearch.UTF8_BOM + normalized)
             self.assertEqual(list(Path(temp_dir).glob("*.tmp")), [])
             self.assertEqual(list(Path(temp_dir).glob(".*.tmp")), [])
+
+    def test_read_config_file_parses_bom_config_when_normalization_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            normalized = b'GROK_SEARCH_MODEL = "model"\n'
+            config_path.write_bytes(websearch.UTF8_BOM + normalized)
+
+            with mock.patch.object(
+                websearch,
+                "normalize_utf8_bom_config",
+                side_effect=websearch.ConfigError("denied"),
+            ):
+                values = websearch.read_config_file(config_path)
+
+            self.assertEqual(values["GROK_SEARCH_MODEL"], "model")
+            self.assertEqual(config_path.read_bytes(), websearch.UTF8_BOM + normalized)
+
+
+class SearchFallbackTests(unittest.TestCase):
+    def test_search_result_status_reports_skip_reason(self) -> None:
+        self.assertEqual(
+            websearch.search_result_status({"skip_reason": "does not support recency filters"}),
+            "does not support recency filters",
+        )
+
+    def test_duckduckgo_search_explains_recency_skip_without_network_request(self) -> None:
+        cfg = websearch.Config({})
+
+        with mock.patch.object(websearch, "request_json") as request_json:
+            result = websearch.duckduckgo_search(
+                cfg,
+                "latest ai news",
+                max_sources=5,
+                detailed=False,
+                include_domains=[],
+                exclude_domains=[],
+                recency_days=7,
+                search_mode="news",
+            )
+
+        request_json.assert_not_called()
+        self.assertEqual(
+            result,
+            {
+                "answer": "",
+                "sources": [],
+                "provider": "duckduckgo",
+                "skip_reason": "does not support recency filters",
+            },
+        )
+
+    def test_duckduckgo_search_explains_domain_skip_without_network_request(self) -> None:
+        cfg = websearch.Config({})
+
+        with mock.patch.object(websearch, "request_json") as request_json:
+            result = websearch.duckduckgo_search(
+                cfg,
+                "python",
+                max_sources=5,
+                detailed=False,
+                include_domains=["example.com"],
+                exclude_domains=[],
+                recency_days=None,
+            )
+
+        request_json.assert_not_called()
+        self.assertEqual(
+            result,
+            {
+                "answer": "",
+                "sources": [],
+                "provider": "duckduckgo",
+                "skip_reason": "does not support domain filters",
+            },
+        )
