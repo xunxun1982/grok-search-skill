@@ -10,6 +10,8 @@ The bundled script uses the first source in this priority order that contains an
 
 Notes:
 
+- The script uses only Python standard library modules. Python 3.11+ is required; no extra `pip install` step is needed.
+- Save `config.toml` as standard UTF-8 without BOM. If a config file starts with a UTF-8 BOM, the script normalizes that file to UTF-8 without BOM before parsing.
 - If a higher-priority source contains any effective value, later sources are ignored entirely.
 - If a higher-priority config file sets provider priority but omits upstreams, environment-variable upstreams are not mixed in. Put priority and upstream settings in the same source, or remove the higher-priority file so the next source can take effect.
 - Environment variables cannot express the `*_UPSTREAMS` arrays. Use `config.toml` for multiple upstream objects.
@@ -30,10 +32,10 @@ TOML example:
 
 ```toml
 # Provider priorities are evaluated in order. Providers omitted from a priority list are disabled.
-# SEARCH_PROVIDER_PRIORITY supports: "grok", "tavily", "exa".
+# SEARCH_PROVIDER_PRIORITY supports: "grok", "tavily", "exa", "duckduckgo".
 # FETCH_PROVIDER_PRIORITY supports: "tavily", "firecrawl", "exa", "plain".
 # MAP_PROVIDER_PRIORITY supports: "tavily", "exa".
-SEARCH_PROVIDER_PRIORITY = ["grok", "tavily", "exa"]
+SEARCH_PROVIDER_PRIORITY = ["grok", "tavily", "exa", "duckduckgo"]
 FETCH_PROVIDER_PRIORITY = ["tavily", "firecrawl", "exa", "plain"]
 MAP_PROVIDER_PRIORITY = ["tavily", "exa"]
 
@@ -54,9 +56,10 @@ FIRECRAWL_UPSTREAMS = [
 ]
 
 # Exa fallback uses the official free-plan MCP endpoint without local key config.
+# DuckDuckGo fallback uses the keyless Instant Answer API.
 
 GROK_SEARCH_TIMEOUT_SECONDS = 120
-GROK_SEARCH_MAX_RETRIES = 5
+GROK_SEARCH_MAX_RETRIES = 2
 GROK_SEARCH_FETCH_MAX_CHARS = 0
 GROK_SEARCH_ALLOW_INTERNAL_FETCH = false
 GROK_SEARCH_RESPONSE_MAX_CHARS = 60000
@@ -80,8 +83,8 @@ Environment variables are intentionally limited to scalar values. They cannot de
 | `FIRECRAWL_API_URL` | Single Firecrawl upstream URL. Default: `https://api.firecrawl.dev`. |
 | `GITHUB_TOKEN` | Optional token for higher GitHub issue/PR fetch limits and private repositories. |
 | `GROK_SEARCH_TIMEOUT_SECONDS` | HTTP timeout. Default: `120`. |
-| `GROK_SEARCH_MAX_RETRIES` | Additional Grok search retries after the first failed attempt. Any Grok error triggers retry until this count is exhausted, then `web_search` falls back to later enabled providers. Default: `5`. |
-| `SEARCH_PROVIDER_PRIORITY` | `web_search` provider priority. Supported values: `grok`, `tavily`, `exa`. Config files may use a TOML array; environment variables may use comma-separated values. Default: `grok,tavily,exa`. Omitted providers are disabled when this is configured. |
+| `GROK_SEARCH_MAX_RETRIES` | Additional Grok search retries after the first failed attempt. Any Grok error triggers retry until this count is exhausted, then `web_search` falls back to later enabled providers. Default: `2`. |
+| `SEARCH_PROVIDER_PRIORITY` | `web_search` provider priority. Supported values: `grok`, `tavily`, `exa`, `duckduckgo`. Config files may use a TOML array; environment variables may use comma-separated values. Default: `grok,tavily,exa,duckduckgo`. Omitted providers are disabled when this is configured. |
 | `FETCH_PROVIDER_PRIORITY` | Generic `web_fetch` provider priority after specialized fetchers. Supported values: `tavily`, `firecrawl`, `exa`, `plain`. Config files may use a TOML array; environment variables may use comma-separated values. Default: `tavily,firecrawl,exa,plain`. Omitted providers are disabled when this is configured. |
 | `MAP_PROVIDER_PRIORITY` | `web_map` provider priority. Supported values: `tavily`, `exa`. Config files may use a TOML array; environment variables may use comma-separated values. Default: `tavily,exa`. Omitted providers are disabled when this is configured. |
 | `SEARCH_CACHE_DIR` | Optional search session cache directory. Default uses the system temp directory. |
@@ -91,13 +94,15 @@ Environment variables are intentionally limited to scalar values. They cannot de
 
 ## Provider Selection
 
-- Default provider priorities are `grok,tavily,exa` for `web_search`, `tavily,firecrawl,exa,plain` for generic `web_fetch`, and `tavily,exa` for `web_map`.
+- Default provider priorities are `grok,tavily,exa,duckduckgo` for `web_search`, `tavily,firecrawl,exa,plain` for generic `web_fetch`, and `tavily,exa` for `web_map`.
 - Priority config reorders providers and disables omitted providers, so `["exa", "tavily"]` makes Exa first and disables Grok for that command. An empty or all-invalid priority list disables every provider for that command.
+- `web_search --mode` supports `general`, `news`, and `academic`. All modes use `SEARCH_PROVIDER_PRIORITY`; `news` also applies a default 7-day recency filter unless `--recency-days` is passed. `academic` is an explicit routing hint and does not reorder providers. Modes that require providers or LLM synthesis not present in this project are intentionally not implemented.
 - With `GROK_SEARCH_UPSTREAMS`, `web_search` randomly selects one Grok/OpenAI-compatible upstream object for the AI answer and calls `/v1/chat/completions`.
 - `web_search --grok-max-retries` overrides `GROK_SEARCH_MAX_RETRIES` for that call. When the flag is omitted, the merged config value is used.
 - With `TAVILY_UPSTREAMS`, search fallback, generic fetch, and map randomly select one Tavily upstream object.
 - With `FIRECRAWL_UPSTREAMS`, generic `fetch` fallback randomly selects one Firecrawl upstream object.
 - Exa uses the official remote MCP endpoint free plan without local key config. In the default priorities, `web_search` uses Exa after Tavily fallback fails, generic `web_fetch` uses Exa after Tavily and Firecrawl fail, and `web_map` uses Exa after Tavily fails or returns no URLs.
+- DuckDuckGo uses the keyless Instant Answer API as the final default `web_search` fallback. It is not a full SERP API and is skipped for domain filters or recency filters it cannot honor.
 - Single-value `GROK_SEARCH_*`, `TAVILY_*`, and `FIRECRAWL_*` keys work as fallback when no upstream table is configured.
 - Empty or partially filled upstream objects are ignored. Upstream array objects must explicitly provide every required field; default endpoint/model values are only used by single-value fallback config.
 - With no provider keys, specialized public fetchers still work for GitHub, StackExchange, arXiv, and Wikipedia URLs.

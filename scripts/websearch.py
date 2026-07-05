@@ -50,9 +50,14 @@ SUPPORTED_ENV_NAMES = [
 APP_DIR_NAME = "web-search-skill"
 EXA_MCP_URL = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa"
 MCP_PROTOCOL_VERSION = "2025-11-25"
-DEFAULT_SEARCH_PROVIDER_PRIORITY = ["grok", "tavily", "exa"]
+HTTP_READ_CHUNK_BYTES = 64 * 1024
+HTTP_RESPONSE_MAX_BYTES = 20 * 1024 * 1024
+HTTP_ERROR_MAX_BYTES = 2000
+UTF8_BOM = b"\xef\xbb\xbf"
+DEFAULT_SEARCH_PROVIDER_PRIORITY = ["grok", "tavily", "exa", "duckduckgo"]
 DEFAULT_FETCH_PROVIDER_PRIORITY = ["tavily", "firecrawl", "exa", "plain"]
 DEFAULT_MAP_PROVIDER_PRIORITY = ["tavily", "exa"]
+SEARCH_MODES = ("general", "news", "academic")
 CONFIG_SOURCE_META_KEY = "__config_source"
 PROVIDER_ALIASES = {
     "ai": "grok",
@@ -65,6 +70,7 @@ PROVIDER_LABELS = {
     "tavily": "Tavily",
     "firecrawl": "Firecrawl",
     "exa": "Exa",
+    "duckduckgo": "DuckDuckGo",
     "plain": "plain HTTP",
 }
 
@@ -230,12 +236,35 @@ def read_config_file(path: Path) -> dict[str, Any]:
     if tomllib is None:  # pragma: no cover - Python < 3.11 only
         raise ConfigError("Python 3.11+ is required to parse TOML configuration")
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
+        if raw.startswith(UTF8_BOM):
+            try:
+                raw = normalize_utf8_bom_config(path, raw)
+            except ConfigError:
+                # On-disk cleanup is best-effort; this load can still parse the normalized bytes.
+                raw = raw[len(UTF8_BOM) :]
+        text = raw.decode("utf-8")
         return tomllib.loads(text)
     except OSError as exc:
         raise ConfigError(f"failed to read config file {path}: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"failed to decode config file {path} as UTF-8: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"failed to parse config file {path}: {exc}") from exc
+
+
+def normalize_utf8_bom_config(path: Path, raw: bytes) -> bytes:
+    normalized = raw[len(UTF8_BOM) :]
+    try:
+        with path.open("r+b") as config_file:
+            # Rewrite in place so existing ACLs, owner, group, and DACL stay attached.
+            config_file.write(normalized)
+            config_file.truncate()
+            config_file.flush()
+            os.fsync(config_file.fileno())
+    except OSError as exc:
+        raise ConfigError(f"failed to normalize UTF-8 BOM in config file {path}: {exc}") from exc
+    return normalized
 
 
 def config_value_is_effective(key: str, value: Any) -> bool:
@@ -379,6 +408,19 @@ def provider_priority(cfg: "Config", env_name: str, default: list[str]) -> list[
     return result
 
 
+def search_priority_for_mode(cfg: "Config", mode: str) -> list[str]:
+    del mode
+    return provider_priority(cfg, "SEARCH_PROVIDER_PRIORITY", DEFAULT_SEARCH_PROVIDER_PRIORITY)
+
+
+def recency_days_for_mode(mode: str, recency_days: int | None) -> int | None:
+    if recency_days is not None:
+        return recency_days
+    if mode == "news":
+        return 7
+    return None
+
+
 @dataclasses.dataclass
 class Config:
     file_values: dict[str, Any]
@@ -406,7 +448,7 @@ class Config:
 
     @property
     def grok_search_max_retries(self) -> int:
-        return max(self.get_int("GROK_SEARCH_MAX_RETRIES", 5), 0)
+        return max(self.get_int("GROK_SEARCH_MAX_RETRIES", 2), 0)
 
     @property
     def fetch_max_chars(self) -> int:
@@ -503,17 +545,9 @@ def request_text(
     try:
         opener = urllib.request.build_opener(PublicRedirectHandler(timeout, allow_internal=allow_internal))
         with opener.open(req, timeout=timeout) as resp:
-            charset = resp.headers.get_content_charset() or "utf-8"
-            body_bytes = resp.read()
-            try:
-                return body_bytes.decode(charset, errors="replace")
-            except LookupError:
-                # Servers sometimes advertise non-standard charset labels; keep
-                # the CLI path stable by falling back to UTF-8 with replacement.
-                return body_bytes.decode("utf-8", errors="replace")
+            return decode_body(read_response_bytes(resp), response_charset(resp))
     except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode("utf-8", errors="replace")
-        raise HttpError(exc.code, error_text[:2000]) from exc
+        raise HttpError(exc.code, read_http_error_text(exc)) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise HttpError(0, f"network failure: {exc}") from exc
 
@@ -544,6 +578,64 @@ def request_json(
 
 def bearer_headers(key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def decode_body(body: bytes, charset: str) -> str:
+    try:
+        return body.decode(charset, errors="replace")
+    except LookupError:
+        # Servers sometimes advertise non-standard charset labels; keep the CLI
+        # path stable by falling back to UTF-8 with replacement.
+        return body.decode("utf-8", errors="replace")
+
+
+def response_charset(resp: Any) -> str:
+    get_charset = getattr(getattr(resp, "headers", None), "get_content_charset", None)
+    if callable(get_charset):
+        return get_charset() or "utf-8"
+    return "utf-8"
+
+
+def read_response_bytes(resp: Any, max_bytes: int | None = None) -> bytes:
+    max_bytes = HTTP_RESPONSE_MAX_BYTES if max_bytes is None else max_bytes
+    if max_bytes <= 0:
+        max_bytes = HTTP_RESPONSE_MAX_BYTES
+    headers = getattr(resp, "headers", None)
+    headers_get = getattr(headers, "get", None)
+    content_length = headers_get("Content-Length") if callable(headers_get) else None
+    if content_length:
+        try:
+            if int(content_length) > max_bytes:
+                raise HttpError(413, f"response body exceeds {max_bytes} bytes")
+        except ValueError:
+            pass
+
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        sized_read = True
+        try:
+            chunk = resp.read(HTTP_READ_CHUNK_BYTES)
+        except TypeError:
+            sized_read = False
+            chunk = resp.read()
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HttpError(413, f"response body exceeds {max_bytes} bytes")
+        chunks.append(chunk)
+        if not sized_read:
+            break
+    return b"".join(chunks)
+
+
+def read_http_error_text(exc: urllib.error.HTTPError) -> str:
+    body = exc.read(HTTP_ERROR_MAX_BYTES + 1)
+    text = body[:HTTP_ERROR_MAX_BYTES].decode("utf-8", errors="replace")
+    if len(body) > HTTP_ERROR_MAX_BYTES:
+        text += "\n[truncated]"
+    return text
 
 
 def parse_sse_json_messages(text: str) -> list[dict[str, Any]]:
@@ -606,10 +698,12 @@ def exa_mcp_post(endpoint: str, payload: dict[str, Any], cfg: Config, session_id
     try:
         opener = urllib.request.build_opener(PublicRedirectHandler(cfg.timeout, allow_internal=False))
         with opener.open(req, timeout=cfg.timeout) as resp:
-            return resp.headers.get("Mcp-Session-Id") or "", resp.read().decode("utf-8", errors="replace")
+            return resp.headers.get("Mcp-Session-Id") or "", decode_body(
+                read_response_bytes(resp),
+                response_charset(resp),
+            )
     except urllib.error.HTTPError as exc:
-        error_text = exc.read().decode("utf-8", errors="replace")
-        raise HttpError(exc.code, error_text[:2000]) from exc
+        raise HttpError(exc.code, read_http_error_text(exc)) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise HttpError(0, f"network failure: {exc}") from exc
 
@@ -675,6 +769,9 @@ def exa_mcp_tool_call(endpoint: str, tool_name: str, arguments: dict[str, Any], 
 def search_result_status(result: dict[str, Any] | None) -> str:
     if result is None:
         return "not configured"
+    skip_reason = result.get("skip_reason")
+    if isinstance(skip_reason, str) and skip_reason:
+        return skip_reason
     if result.get("answer") or result.get("sources") or result.get("urls"):
         return ""
     return "returned no usable results"
@@ -692,7 +789,10 @@ def clean_found_url(url: str) -> str:
     clean = url.strip()
     for marker in ("\\n", "\\t", "\\", "`", "<"):
         clean = clean.split(marker, 1)[0]
-    return clean.rstrip(".,;*)]}")
+    clean = clean.rstrip(".,;*]}")
+    while clean.endswith(")") and clean.count("(") < clean.count(")"):
+        clean = clean[:-1].rstrip(".,;*]}")
+    return clean
 
 
 def find_urls(obj: Any) -> list[str]:
@@ -708,7 +808,7 @@ def find_urls(obj: Any) -> list[str]:
             for item in value:
                 walk(item)
         elif isinstance(value, str):
-            found.extend(re.findall(r"https?://[^\s\[\])>`\"']+", value))
+            found.extend(re.findall(r"https?://[^\s\[\]>`\"']+", value))
 
     walk(obj)
     deduped: list[str] = []
@@ -719,6 +819,57 @@ def find_urls(obj: Any) -> list[str]:
             seen.add(clean)
             deduped.append(clean)
     return deduped
+
+
+def make_source(
+    provider: str,
+    url: str,
+    *,
+    title: Any = None,
+    content: Any = "",
+    score: Any = None,
+    published_date: Any = None,
+) -> dict[str, Any] | None:
+    clean_url = clean_found_url(str(url or ""))
+    if not clean_url:
+        return None
+    return {
+        "title": str(title or clean_url),
+        "url": clean_url,
+        "content": str(content or ""),
+        "score": score,
+        "published_date": published_date,
+        "provider": provider,
+    }
+
+
+def append_source(
+    sources: list[dict[str, Any]],
+    seen: set[str],
+    provider: str,
+    url: str,
+    *,
+    max_sources: int | None = None,
+    title: Any = None,
+    content: Any = "",
+    score: Any = None,
+    published_date: Any = None,
+) -> bool:
+    if max_sources is not None and len(sources) >= max_sources:
+        return False
+    source = make_source(
+        provider,
+        url,
+        title=title,
+        content=content,
+        score=score,
+        published_date=published_date,
+    )
+    if source is None or source["url"] in seen:
+        return False
+    seen.add(source["url"])
+    sources.append(source)
+    return True
 
 
 def extract_ai_text(data: dict[str, Any]) -> str:
@@ -800,6 +951,7 @@ def tavily_search(
     include_domains: list[str],
     exclude_domains: list[str],
     recency_days: int | None,
+    search_mode: str = "general",
 ) -> dict[str, Any] | None:
     upstream = random_upstream(cfg, "tavily")
     if not upstream:
@@ -821,6 +973,8 @@ def tavily_search(
         payload["include_domains"] = include_domains
     if exclude_domains:
         payload["exclude_domains"] = exclude_domains
+    if search_mode == "news":
+        payload["topic"] = "news"
     if recency_days:
         payload["topic"] = "news"
         payload["days"] = recency_days
@@ -835,22 +989,21 @@ def tavily_search(
     )
     results = data.get("results", [])
     sources: list[dict[str, Any]] = []
+    seen: set[str] = set()
     if isinstance(results, list):
         for item in results:
             if not isinstance(item, dict):
                 continue
-            url = str(item.get("url") or "").strip()
-            if not url:
-                continue
-            sources.append(
-                {
-                    "title": item.get("title") or url,
-                    "url": url,
-                    "content": item.get("raw_content") or item.get("content") or "",
-                    "score": item.get("score"),
-                    "published_date": item.get("published_date"),
-                    "provider": "tavily",
-                }
+            append_source(
+                sources,
+                seen,
+                "tavily",
+                str(item.get("url") or ""),
+                max_sources=max_sources,
+                title=item.get("title"),
+                content=item.get("raw_content") or item.get("content") or "",
+                score=item.get("score"),
+                published_date=item.get("published_date"),
             )
     return {
         "answer": data.get("answer") or "",
@@ -870,10 +1023,6 @@ def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
         for item in data["results"]:
             if not isinstance(item, dict):
                 continue
-            url = clean_found_url(str(item.get("url") or ""))
-            if not url or url in seen:
-                continue
-            seen.add(url)
             content = ""
             if isinstance(item.get("text"), str):
                 content = item["text"]
@@ -881,17 +1030,17 @@ def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
                 content = "\n".join(part for part in item["highlights"] if isinstance(part, str))
             elif isinstance(item.get("summary"), str):
                 content = item["summary"]
+            url = str(item.get("url") or "")
             title = str(item.get("title") or url)
             block = "\n".join(part for part in [f"Title: {title}", f"URL: {url}", content] if part).strip()
-            sources.append(
-                {
-                    "title": title,
-                    "url": url,
-                    "content": block,
-                    "score": None,
-                    "published_date": item.get("publishedDate"),
-                    "provider": "exa",
-                }
+            append_source(
+                sources,
+                seen,
+                "exa",
+                url,
+                title=title,
+                content=block,
+                published_date=item.get("publishedDate"),
             )
         return sources
 
@@ -909,18 +1058,16 @@ def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
             current_url = ""
             current_lines = []
             return
-        seen.add(current_url)
         block = "\n".join(current_lines).strip()
         published_match = re.search(r"(?m)^Published:\s*(.+)$", block)
-        sources.append(
-            {
-                "title": current_title or current_url,
-                "url": current_url,
-                "content": block,
-                "score": None,
-                "published_date": published_match.group(1).strip() if published_match else None,
-                "provider": "exa",
-            }
+        append_source(
+            sources,
+            seen,
+            "exa",
+            current_url,
+            title=current_title or current_url,
+            content=block,
+            published_date=published_match.group(1).strip() if published_match else None,
         )
         current_title = ""
         current_url = ""
@@ -945,9 +1092,7 @@ def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
     if sources:
         return sources
     for url in find_urls({"text": text}):
-        if url not in seen:
-            seen.add(url)
-            sources.append({"title": url, "url": url, "content": "", "score": None, "published_date": None, "provider": "exa"})
+        append_source(sources, seen, "exa", url)
     return sources
 
 
@@ -960,7 +1105,9 @@ def exa_search(
     include_domains: list[str],
     exclude_domains: list[str],
     recency_days: int | None,
+    search_mode: str = "general",
 ) -> dict[str, Any] | None:
+    del search_mode
     tool_name = "web_search_exa"
     payload: dict[str, Any] = {"query": query, "numResults": max_sources}
     use_advanced = detailed or bool(include_domains or exclude_domains or recency_days)
@@ -989,11 +1136,132 @@ def exa_search(
     }
 
 
+def duckduckgo_related_topics(items: Any) -> list[dict[str, str]]:
+    topics: list[dict[str, str]] = []
+    if not isinstance(items, list):
+        return topics
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        text = non_blank_text(item.get("Text"))
+        url = non_blank_text(item.get("FirstURL"))
+        if text and url:
+            topics.append({"title": text.split(" - ", 1)[0], "url": url, "content": text})
+        topics.extend(duckduckgo_related_topics(item.get("Topics")))
+    return topics
+
+
+def duckduckgo_search(
+    cfg: Config,
+    query: str,
+    *,
+    max_sources: int,
+    detailed: bool,
+    include_domains: list[str],
+    exclude_domains: list[str],
+    recency_days: int | None,
+    search_mode: str = "general",
+) -> dict[str, Any] | None:
+    del detailed, search_mode
+    if include_domains or exclude_domains:
+        return {
+            "answer": "",
+            "sources": [],
+            "provider": "duckduckgo",
+            "skip_reason": "does not support domain filters",
+        }
+    if recency_days:
+        # Instant Answer is not a full SERP/news API; keep recency semantics by skipping unfiltered results.
+        return {
+            "answer": "",
+            "sources": [],
+            "provider": "duckduckgo",
+            "skip_reason": "does not support recency filters",
+        }
+
+    params = urllib.parse.urlencode(
+        {
+            "q": query,
+            "format": "json",
+            "no_html": "1",
+            "skip_disambig": "1",
+            "t": APP_DIR_NAME,
+        }
+    )
+    data = request_json(
+        "GET",
+        f"https://api.duckduckgo.com/?{params}",
+        headers={"User-Agent": USER_AGENT},
+        payload=None,
+        timeout=cfg.timeout,
+        allow_internal=False,
+    )
+
+    answer = (
+        non_blank_text(data.get("AbstractText"))
+        or non_blank_text(data.get("Answer"))
+        or non_blank_text(data.get("Definition"))
+        or ""
+    )
+    sources: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    abstract_url = non_blank_text(data.get("AbstractURL"))
+    if abstract_url and answer:
+        append_source(
+            sources,
+            seen,
+            "duckduckgo",
+            abstract_url,
+            max_sources=max_sources,
+            title=non_blank_text(data.get("Heading")) or abstract_url,
+            content=answer,
+        )
+
+    definition_url = non_blank_text(data.get("DefinitionURL"))
+    definition = non_blank_text(data.get("Definition"))
+    if definition_url and definition:
+        append_source(
+            sources,
+            seen,
+            "duckduckgo",
+            definition_url,
+            max_sources=max_sources,
+            title=non_blank_text(data.get("Heading")) or definition_url,
+            content=definition,
+        )
+
+    for item in duckduckgo_related_topics(data.get("RelatedTopics")):
+        append_source(
+            sources,
+            seen,
+            "duckduckgo",
+            item["url"],
+            max_sources=max_sources,
+            title=item["title"],
+            content=item["content"],
+        )
+
+    return {
+        "answer": answer,
+        "sources": sources,
+        "provider": "duckduckgo",
+    }
+
+
 def save_session(cfg: Config, payload: dict[str, Any]) -> str:
     session_id = uuid.uuid4().hex[:16]
     cfg.cache_dir.mkdir(parents=True, exist_ok=True)
     path = cfg.cache_dir / f"{session_id}.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = cfg.cache_dir / f".{session_id}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
     return session_id
 
 
@@ -1007,17 +1275,23 @@ def read_session(cfg: Config, session_id: str) -> dict[str, Any]:
 
 
 def command_search(args: argparse.Namespace, cfg: Config) -> None:
+    mode = getattr(args, "mode", "general")
     detailed = args.format == "detailed"
     max_chars = args.max_chars or cfg.response_max_chars
     max_retries = args.grok_max_retries if args.grok_max_retries is not None else cfg.grok_search_max_retries
     max_retries = max(max_retries, 0)
+    recency_days = recency_days_for_mode(mode, args.recency_days)
     warnings: list[str] = []
-    ai_result: dict[str, Any] | None = None
-    tavily_result: dict[str, Any] | None = None
-    exa_result: dict[str, Any] | None = None
-    priority = provider_priority(cfg, "SEARCH_PROVIDER_PRIORITY", DEFAULT_SEARCH_PROVIDER_PRIORITY)
+    selected_result: dict[str, Any] | None = None
+    priority = search_priority_for_mode(cfg, mode)
     if not priority:
         warnings.append("No search provider is enabled.")
+
+    searchers = {
+        "tavily": tavily_search,
+        "exa": exa_search,
+        "duckduckgo": duckduckgo_search,
+    }
 
     for index, provider in enumerate(priority):
         next_provider = priority[index + 1] if index + 1 < len(priority) else ""
@@ -1025,8 +1299,8 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
             grok_status = "unavailable"
             for attempt in range(max_retries + 1):
                 try:
-                    ai_result = ai_search(cfg, args.query)
-                    grok_status = search_result_status(ai_result)
+                    result = ai_search(cfg, args.query)
+                    grok_status = search_result_status(result)
                     if grok_status == "not configured":
                         warnings.append("AI provider not configured; using search fallbacks.")
                     elif grok_status:
@@ -1038,84 +1312,54 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
             else:
                 warnings.append(fallback_warning(provider, grok_status, next_provider))
             if not grok_status:
+                selected_result = result
                 break
-            ai_result = None
             continue
 
-        if provider == "tavily":
-            try:
-                tavily_result = tavily_search(
-                    cfg,
-                    args.query,
-                    max_sources=args.max_sources,
-                    detailed=detailed,
-                    include_domains=args.include_domain,
-                    exclude_domains=args.exclude_domain,
-                    recency_days=args.recency_days,
-                )
-            except Exception as exc:  # noqa: BLE001
-                tavily_result = None
-                warnings.append(f"Tavily failed: {exc}")
-                continue
-            tavily_status = search_result_status(tavily_result)
-            if not tavily_status:
-                break
-            warnings.append(fallback_warning(provider, tavily_status, next_provider))
-            tavily_result = None
+        searcher = searchers.get(provider)
+        if searcher is None:
             continue
-
-        if provider == "exa":
-            try:
-                exa_result = exa_search(
-                    cfg,
-                    args.query,
-                    max_sources=args.max_sources,
-                    detailed=detailed,
-                    include_domains=args.include_domain,
-                    exclude_domains=args.exclude_domain,
-                    recency_days=args.recency_days,
-                )
-            except Exception as exc:  # noqa: BLE001
-                exa_result = None
-                warnings.append(f"Exa failed: {exc}")
-                continue
-            exa_status = search_result_status(exa_result)
-            if not exa_status:
-                break
-            warnings.append(fallback_warning(provider, exa_status, next_provider))
-            exa_result = None
+        try:
+            result = searcher(
+                cfg,
+                args.query,
+                max_sources=args.max_sources,
+                detailed=detailed,
+                include_domains=args.include_domain,
+                exclude_domains=args.exclude_domain,
+                recency_days=recency_days,
+                search_mode=mode,
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"{PROVIDER_LABELS.get(provider, provider)} failed: {exc}")
+            continue
+        status = search_result_status(result)
+        if not status:
+            selected_result = result
+            break
+        warnings.append(fallback_warning(provider, status, next_provider))
 
     answer_parts: list[str] = []
-    if ai_result and ai_result.get("answer"):
-        answer_parts.append(str(ai_result["answer"]).strip())
-    if tavily_result and tavily_result.get("answer"):
-        answer_parts.append(str(tavily_result["answer"]).strip())
-    if exa_result and exa_result.get("answer"):
-        answer_parts.append(str(exa_result["answer"]).strip())
+    if selected_result and selected_result.get("answer"):
+        answer_parts.append(str(selected_result["answer"]).strip())
     answer = "\n\n".join(part for part in answer_parts if part) or "No answer text returned."
 
     sources: list[dict[str, Any]] = []
     seen: set[str] = set()
-    if ai_result:
-        for url in ai_result.get("urls", []):
+    if selected_result:
+        for url in selected_result.get("urls", []):
             if url not in seen:
                 seen.add(url)
                 sources.append({"title": url, "url": url, "provider": "ai"})
-    if tavily_result:
-        for item in tavily_result.get("sources", []):
-            url = item.get("url")
-            if url and url not in seen:
-                seen.add(url)
-                sources.append(item)
-    if exa_result:
-        for item in exa_result.get("sources", []):
-            url = item.get("url")
+        for item in selected_result.get("sources", []):
+            url = item.get("url") if isinstance(item, dict) else None
             if url and url not in seen:
                 seen.add(url)
                 sources.append(item)
 
     session_payload = {
         "query": args.query,
+        "mode": mode,
         "created_at": int(time.time()),
         "answer": answer,
         "sources": sources,
@@ -1126,6 +1370,7 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
     output = {
         "session_id": session_id,
         "query": args.query,
+        "mode": mode,
         "answer": answer,
         "sources_count": len(sources),
         "sources": sources if detailed else [{k: v for k, v in s.items() if k != "content"} for s in sources],
@@ -1526,6 +1771,7 @@ def command_doctor(args: argparse.Namespace, cfg: Config) -> None:
         "tavily": any("tavily" in priority for priority in (search_priority, fetch_priority, map_priority)),
         "firecrawl": "firecrawl" in fetch_priority,
         "exa": any("exa" in priority for priority in (search_priority, fetch_priority, map_priority)),
+        "duckduckgo": "duckduckgo" in search_priority,
         "plain": "plain" in fetch_priority,
     }
     checks: dict[str, Any] = {
@@ -1542,6 +1788,7 @@ def command_doctor(args: argparse.Namespace, cfg: Config) -> None:
             "fetch": fetch_priority,
             "map": map_priority,
         },
+        "search_modes": {mode: search_priority_for_mode(cfg, mode) for mode in SEARCH_MODES},
         "provider_enabled": provider_enabled,
         "has_github_token": bool(cfg.get("GITHUB_TOKEN")),
         "environment": env_presence(),
@@ -1583,6 +1830,15 @@ def command_doctor(args: argparse.Namespace, cfg: Config) -> None:
             "auth": "free-plan-no-key",
         }
     )
+    probes.append(
+        {
+            "name": "duckduckgo-instant-answer",
+            "endpoint": "https://api.duckduckgo.com/",
+            "configured": True,
+            "enabled": provider_enabled["duckduckgo"],
+            "auth": "no-key",
+        }
+    )
     checks["probes"] = probes
     print(json.dumps(checks, ensure_ascii=False, indent=2))
 
@@ -1594,6 +1850,7 @@ def build_parser() -> argparse.ArgumentParser:
     def add_search(name: str, help_text: str | None) -> None:
         p = sub.add_parser(name, help=help_text)
         p.add_argument("--query", required=True)
+        p.add_argument("--mode", choices=SEARCH_MODES, default="general")
         p.add_argument("--format", choices=["concise", "detailed"], default="concise")
         p.add_argument("--include-domain", action="append", default=[])
         p.add_argument("--exclude-domain", action="append", default=[])

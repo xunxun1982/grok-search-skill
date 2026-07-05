@@ -1,6 +1,7 @@
 ---
 name: web-search-skill
 description: Use when the user asks for web search, internet search, 联网搜索, current/latest information, reading or verifying a URL, online document, API docs, 网络文档, prior web_search sources, site URL discovery, or web-search-skill configuration/connectivity diagnosis.
+version: "1.0"
 ---
 
 # Web Search Skill
@@ -44,6 +45,7 @@ python scripts/websearch.py <command> [options]
 
 - Read `references/tools-and-best-practices.md` for command options, output handling, provider fallback, and safety rules.
 - Read `references/configuration.md` before configuring keys, endpoints, provider priority, cache paths, retry counts, timeouts, response budgets, or internal fetch behavior.
+- Use `web_search --mode news` or `--mode academic` only when the requested search type is explicit; modes are routing hints, not intent guessing.
 - Run `doctor` first when configuration, connectivity, upstream selection, provider enablement, or credentials are uncertain. Report only redacted diagnostics.
 - Prefer config files over command-line overrides. Pass only task inputs such as `--query`, `--url`, `--session-id`, `--offset`, and `--limit` unless the user asks for a one-off override.
 - Configuration sources are not merged. The first source with any effective value wins as a whole; confirm with `doctor` before assuming environment variables supplement a config file.
