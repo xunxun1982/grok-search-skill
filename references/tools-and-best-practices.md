@@ -2,6 +2,8 @@
 
 ## Commands
 
+Run these commands from the skill directory root, not the user's project directory. This inherits the execution-root rule from `SKILL.md`; do not hard-code installation paths.
+
 | Command | Use When |
 |---|---|
 | `web_search` | You need live discovery and do not have a known URL. |

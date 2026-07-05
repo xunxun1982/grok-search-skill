@@ -10,6 +10,8 @@ version: "1.0"
 
 Run the bundled script directly. Do not route through a preconfigured external tool server or require a registered service.
 
+Run it from the skill directory root: the directory containing this `SKILL.md`. Set the shell working directory there before running the command; never run it from the user's project directory or hard-code an installation path.
+
 Use:
 
 ```bash
