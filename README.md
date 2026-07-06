@@ -32,7 +32,7 @@ Important details:
 - Agents should not add optional tuning flags by default, because that can silently override the user's configured behavior. Use config for retry counts, source limits, response budgets, timeouts, provider endpoints, cache paths, and similar settings unless the user explicitly asks for a different value on one command.
 - Environment variables cannot express `*_UPSTREAMS` arrays. Use `config.toml` for multiple upstreams.
 - Environment variables are useful as their own source for single-upstream keys (`GROK_SEARCH_API_KEY`, `GROK_SEARCH_URL`, `GROK_SEARCH_MODEL`, `TAVILY_API_KEY`, `TAVILY_API_URL`, `FIRECRAWL_API_KEY`, `FIRECRAWL_API_URL`) and scalar settings such as `GITHUB_TOKEN`, `GROK_SEARCH_TIMEOUT_SECONDS`, `GROK_SEARCH_MAX_RETRIES`, `SEARCH_PROVIDER_PRIORITY`, `FETCH_PROVIDER_PRIORITY`, `MAP_PROVIDER_PRIORITY`, `SEARCH_CACHE_DIR`, `GROK_SEARCH_FETCH_MAX_CHARS`, `GROK_SEARCH_ALLOW_INTERNAL_FETCH`, and `GROK_SEARCH_RESPONSE_MAX_CHARS`.
-- Exa fallback uses the official remote MCP endpoint free plan without local Exa key config. DuckDuckGo fallback uses the keyless Instant Answer API, not DuckDuckGo HTML result scraping.
+- Exa fallback uses the official remote MCP endpoint free plan without local Exa key config. DuckDuckGo fallback uses keyless DuckDuckGo HTML search, with Instant Answer used only as an error candidate when HTML search fails.
 - `GROK_SEARCH_MAX_RETRIES` controls additional Grok `web_search` retries after the first failed attempt. Any Grok error triggers retry; default fallback order is Tavily, Exa, then DuckDuckGo, and provider priorities can be adjusted per command.
 - Provider priority values are `grok,tavily,exa,duckduckgo` for `SEARCH_PROVIDER_PRIORITY`, `tavily,firecrawl,exa,plain` for `FETCH_PROVIDER_PRIORITY`, and `tavily,exa` for `MAP_PROVIDER_PRIORITY`; omitted providers are disabled when a priority list is configured, and an empty or all-invalid list disables every provider for that command.
 - `web_search --mode` supports `general`, `news`, and `academic`. All modes use `SEARCH_PROVIDER_PRIORITY`; `news` also applies a default 7-day recency filter unless `--recency-days` is passed. `academic` is an explicit routing hint and does not reorder providers.
@@ -86,7 +86,7 @@ FIRECRAWL_UPSTREAMS = [
 ]
 
 # Exa fallback uses the official free-plan MCP endpoint without local key config.
-# DuckDuckGo fallback uses the keyless Instant Answer API.
+# DuckDuckGo fallback uses keyless DuckDuckGo HTML search.
 
 GROK_SEARCH_MAX_RETRIES = 2
 GROK_SEARCH_ALLOW_INTERNAL_FETCH = false

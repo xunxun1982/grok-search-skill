@@ -56,7 +56,7 @@ FIRECRAWL_UPSTREAMS = [
 ]
 
 # Exa fallback uses the official free-plan MCP endpoint without local key config.
-# DuckDuckGo fallback uses the keyless Instant Answer API.
+# DuckDuckGo fallback uses keyless DuckDuckGo HTML search.
 
 GROK_SEARCH_TIMEOUT_SECONDS = 120
 GROK_SEARCH_MAX_RETRIES = 2
@@ -102,7 +102,7 @@ Environment variables are intentionally limited to scalar values. They cannot de
 - With `TAVILY_UPSTREAMS`, search fallback, generic fetch, and map randomly select one Tavily upstream object.
 - With `FIRECRAWL_UPSTREAMS`, generic `fetch` fallback randomly selects one Firecrawl upstream object.
 - Exa uses the official remote MCP endpoint free plan without local key config. In the default priorities, `web_search` uses Exa after Tavily fallback fails, generic `web_fetch` uses Exa after Tavily and Firecrawl fail, and `web_map` uses Exa after Tavily fails or returns no URLs.
-- DuckDuckGo uses the keyless Instant Answer API as the final default `web_search` fallback. It is not a full SERP API and is skipped for domain filters or recency filters it cannot honor.
+- DuckDuckGo uses keyless HTML search as the final default `web_search` fallback. It supports basic domain filters through `site:` queries plus post-filtering, maps recency to DuckDuckGo `df`, and uses Instant Answer only as an error candidate when HTML search fails.
 - Single-value `GROK_SEARCH_*`, `TAVILY_*`, and `FIRECRAWL_*` keys work as fallback when no upstream table is configured.
 - Empty or partially filled upstream objects are ignored. Upstream array objects must explicitly provide every required field; default endpoint/model values are only used by single-value fallback config.
 - With no provider keys, specialized public fetchers still work for GitHub, StackExchange, arXiv, and Wikipedia URLs.
