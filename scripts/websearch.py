@@ -17,6 +17,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,8 @@ SUPPORTED_ENV_NAMES = [
 ]
 APP_DIR_NAME = "web-search-skill"
 EXA_MCP_URL = "https://mcp.exa.ai/mcp?tools=web_search_exa,web_fetch_exa,web_search_advanced_exa"
+DUCKDUCKGO_HTML_URL = "https://html.duckduckgo.com/html"
+DUCKDUCKGO_INSTANT_ANSWER_URL = "https://api.duckduckgo.com/"
 MCP_PROTOCOL_VERSION = "2025-11-25"
 HTTP_READ_CHUNK_BYTES = 64 * 1024
 HTTP_RESPONSE_MAX_BYTES = 20 * 1024 * 1024
@@ -1136,6 +1139,137 @@ def exa_search(
     }
 
 
+def duckduckgo_extract_result_url(href: str) -> str:
+    value = html.unescape(str(href or "").strip())
+    if not value:
+        return ""
+    absolute = urllib.parse.urljoin("https://duckduckgo.com", value)
+    parsed = urllib.parse.urlparse(absolute)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        uddg = urllib.parse.parse_qs(parsed.query).get("uddg", [""])[0]
+        if uddg:
+            absolute = uddg
+    return clean_found_url(absolute)
+
+
+class DuckDuckGoHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict[str, str]] = []
+        self._capture: tuple[str, int] | None = None
+        self._capture_depth = 0
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = {key.lower(): value or "" for key, value in attrs}
+        classes = set(attr_map.get("class", "").split())
+        if "result__a" in classes:
+            url = duckduckgo_extract_result_url(attr_map.get("href", ""))
+            self.results.append({"title": "", "url": url, "content": ""})
+            self._start_capture("title", len(self.results) - 1)
+            return
+        if "result__snippet" in classes and self.results:
+            self._start_capture("content", len(self.results) - 1)
+            return
+        if self._capture is not None:
+            self._capture_depth += 1
+
+    def handle_data(self, data: str) -> None:
+        if self._capture is not None:
+            self._parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        del tag
+        if self._capture is None:
+            return
+        self._capture_depth -= 1
+        if self._capture_depth <= 0:
+            self._finish_capture()
+
+    def _start_capture(self, field: str, index: int) -> None:
+        self._capture = (field, index)
+        self._capture_depth = 1
+        self._parts = []
+
+    def _finish_capture(self) -> None:
+        if self._capture is None:
+            return
+        field, index = self._capture
+        text = re.sub(r"\s+", " ", "".join(self._parts)).strip()
+        if 0 <= index < len(self.results):
+            self.results[index][field] = text
+        self._capture = None
+        self._capture_depth = 0
+        self._parts = []
+
+
+def duckduckgo_time_filter(recency_days: int | None) -> str:
+    if recency_days is None or recency_days <= 0:
+        return ""
+    if recency_days <= 1:
+        return "d"
+    if recency_days <= 7:
+        return "w"
+    if recency_days <= 31:
+        return "m"
+    return "y"
+
+
+def host_matches_domain(host: str, domain: str) -> bool:
+    normalized_host = host.lower().removeprefix("www.")
+    normalized_domain = domain.lower().strip().removeprefix("www.")
+    return normalized_host == normalized_domain or normalized_host.endswith("." + normalized_domain)
+
+
+def url_matches_any_domain(url: str, domains: list[str]) -> bool:
+    if not domains:
+        return False
+    host = urllib.parse.urlparse(url).hostname or ""
+    return any(host_matches_domain(host, domain) for domain in domains if domain.strip())
+
+
+def duckduckgo_query(query: str, include_domains: list[str]) -> str:
+    domains = [domain.strip() for domain in include_domains if domain.strip()]
+    if not domains:
+        return query
+    if len(domains) == 1:
+        return f"site:{domains[0]} {query}"
+    sites = " OR ".join(f"site:{domain}" for domain in domains)
+    return f"({sites}) {query}"
+
+
+def duckduckgo_parse_html_sources(
+    text: str,
+    *,
+    max_sources: int,
+    include_domains: list[str],
+    exclude_domains: list[str],
+) -> list[dict[str, Any]]:
+    parser = DuckDuckGoHTMLParser()
+    parser.feed(text)
+    parser.close()
+    sources: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in parser.results:
+        url = item.get("url", "")
+        if not url.startswith(("http://", "https://")):
+            continue
+        if include_domains and not url_matches_any_domain(url, include_domains):
+            continue
+        if exclude_domains and url_matches_any_domain(url, exclude_domains):
+            continue
+        append_source(
+            sources,
+            seen,
+            "duckduckgo",
+            url,
+            max_sources=max_sources,
+            title=item.get("title") or url,
+            content=item.get("content") or "",
+        )
+    return sources
+
+
 def duckduckgo_related_topics(items: Any) -> list[dict[str, str]]:
     topics: list[dict[str, str]] = []
     if not isinstance(items, list):
@@ -1151,34 +1285,14 @@ def duckduckgo_related_topics(items: Any) -> list[dict[str, str]]:
     return topics
 
 
-def duckduckgo_search(
+def duckduckgo_instant_answer_search(
     cfg: Config,
     query: str,
     *,
     max_sources: int,
-    detailed: bool,
     include_domains: list[str],
     exclude_domains: list[str],
-    recency_days: int | None,
-    search_mode: str = "general",
 ) -> dict[str, Any] | None:
-    del detailed, search_mode
-    if include_domains or exclude_domains:
-        return {
-            "answer": "",
-            "sources": [],
-            "provider": "duckduckgo",
-            "skip_reason": "does not support domain filters",
-        }
-    if recency_days:
-        # Instant Answer is not a full SERP/news API; keep recency semantics by skipping unfiltered results.
-        return {
-            "answer": "",
-            "sources": [],
-            "provider": "duckduckgo",
-            "skip_reason": "does not support recency filters",
-        }
-
     params = urllib.parse.urlencode(
         {
             "q": query,
@@ -1190,7 +1304,7 @@ def duckduckgo_search(
     )
     data = request_json(
         "GET",
-        f"https://api.duckduckgo.com/?{params}",
+        f"{DUCKDUCKGO_INSTANT_ANSWER_URL}?{params}",
         headers={"User-Agent": USER_AGENT},
         payload=None,
         timeout=cfg.timeout,
@@ -1232,19 +1346,111 @@ def duckduckgo_search(
         )
 
     for item in duckduckgo_related_topics(data.get("RelatedTopics")):
+        url = item["url"]
+        if include_domains and not url_matches_any_domain(url, include_domains):
+            continue
+        if exclude_domains and url_matches_any_domain(url, exclude_domains):
+            continue
         append_source(
             sources,
             seen,
             "duckduckgo",
-            item["url"],
+            url,
             max_sources=max_sources,
             title=item["title"],
             content=item["content"],
         )
 
+    if include_domains or exclude_domains:
+        sources = [
+            source
+            for source in sources
+            if (not include_domains or url_matches_any_domain(str(source.get("url", "")), include_domains))
+            and (not exclude_domains or not url_matches_any_domain(str(source.get("url", "")), exclude_domains))
+        ]
+        if not sources:
+            answer = ""
+
     return {
         "answer": answer,
         "sources": sources,
+        "provider": "duckduckgo",
+    }
+
+
+def duckduckgo_search(
+    cfg: Config,
+    query: str,
+    *,
+    max_sources: int,
+    detailed: bool,
+    include_domains: list[str],
+    exclude_domains: list[str],
+    recency_days: int | None,
+    search_mode: str = "general",
+) -> dict[str, Any] | None:
+    del detailed, search_mode
+    params = {
+        "q": duckduckgo_query(query, include_domains),
+        "kl": "us-en",
+        "p": "-1",
+    }
+    time_filter = duckduckgo_time_filter(recency_days)
+    if time_filter:
+        params["df"] = time_filter
+    html_error = ""
+    try:
+        text = request_text(
+            "GET",
+            f"{DUCKDUCKGO_HTML_URL}?{urllib.parse.urlencode(params)}",
+            headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
+            timeout=cfg.timeout,
+            allow_internal=False,
+        )
+        sources = duckduckgo_parse_html_sources(
+            text,
+            max_sources=max_sources,
+            include_domains=include_domains,
+            exclude_domains=exclude_domains,
+        )
+        if sources:
+            return {
+                "answer": "",
+                "sources": sources,
+                "provider": "duckduckgo",
+            }
+    except Exception as exc:  # noqa: BLE001
+        html_error = str(exc)
+
+    # Instant Answer is only an error candidate. It cannot honor recency, so do
+    # not silently return it for freshness-sensitive searches.
+    if recency_days is None or recency_days <= 0:
+        try:
+            result = duckduckgo_instant_answer_search(
+                cfg,
+                query,
+                max_sources=max_sources,
+                include_domains=include_domains,
+                exclude_domains=exclude_domains,
+            )
+            if result and search_result_status(result) == "":
+                return result
+        except Exception as exc:  # noqa: BLE001
+            if html_error:
+                html_error = f"{html_error}; Instant Answer failed: {exc}"
+            else:
+                html_error = f"Instant Answer failed: {exc}"
+
+    if html_error:
+        return {
+            "answer": "",
+            "sources": [],
+            "provider": "duckduckgo",
+            "skip_reason": f"html search failed: {html_error}",
+        }
+    return {
+        "answer": "",
+        "sources": [],
         "provider": "duckduckgo",
     }
 
