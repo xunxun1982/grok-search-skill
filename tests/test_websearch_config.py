@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import os
 import sys
 import tempfile
@@ -12,6 +14,30 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT_DIR / "scripts"))
 
 import websearch  # noqa: E402
+
+
+class DoctorTests(unittest.TestCase):
+    def test_doctor_reports_duckduckgo_html_backend(self) -> None:
+        cfg = websearch.Config({})
+        output = io.StringIO()
+
+        with mock.patch("sys.stdout", output):
+            websearch.command_doctor(mock.Mock(), cfg)
+
+        payload = json.loads(output.getvalue())
+        probes = payload["probes"]
+        probe_names = [probe["name"] for probe in probes]
+        duckduckgo_probe = next(probe for probe in probes if probe["name"] == "duckduckgo-html")
+
+        self.assertNotIn("duckduckgo-instant-answer", probe_names)
+        self.assertEqual(duckduckgo_probe["endpoint"], websearch.DUCKDUCKGO_HTML_URL)
+        self.assertEqual(duckduckgo_probe["auth"], "no-key")
+        self.assertTrue(duckduckgo_probe["supports_domain_filter"])
+        self.assertTrue(duckduckgo_probe["supports_recency_filter"])
+        self.assertEqual(
+            duckduckgo_probe["instant_answer_fallback_endpoint"],
+            websearch.DUCKDUCKGO_INSTANT_ANSWER_URL,
+        )
 
 
 class ConfigBomTests(unittest.TestCase):

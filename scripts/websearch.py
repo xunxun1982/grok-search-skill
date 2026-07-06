@@ -2043,11 +2043,14 @@ def command_doctor(args: argparse.Namespace, cfg: Config) -> None:
     )
     probes.append(
         {
-            "name": "duckduckgo-instant-answer",
-            "endpoint": "https://api.duckduckgo.com/",
+            "name": "duckduckgo-html",
+            "endpoint": DUCKDUCKGO_HTML_URL,
             "configured": True,
             "enabled": provider_enabled["duckduckgo"],
             "auth": "no-key",
+            "supports_domain_filter": True,
+            "supports_recency_filter": True,
+            "instant_answer_fallback_endpoint": DUCKDUCKGO_INSTANT_ANSWER_URL,
         }
     )
     checks["probes"] = probes
