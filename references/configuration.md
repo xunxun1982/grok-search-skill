@@ -83,7 +83,7 @@ Environment variables are intentionally limited to scalar values. They cannot de
 | `FIRECRAWL_API_URL` | Single Firecrawl upstream URL. Default: `https://api.firecrawl.dev`. |
 | `GITHUB_TOKEN` | Optional token for higher GitHub issue/PR fetch limits and private repositories. |
 | `GROK_SEARCH_TIMEOUT_SECONDS` | HTTP timeout. Default: `120`. |
-| `GROK_SEARCH_MAX_RETRIES` | Additional Grok search retries after the first failed attempt. Any Grok error triggers retry until this count is exhausted, then `web_search` falls back to later enabled providers. Default: `2`. |
+| `GROK_SEARCH_MAX_RETRIES` | Additional Grok search retries after the first failed attempt, capped at `5`. Only network failures, timeouts, HTTP `408`, `429`, and `5xx` responses retry; permanent `4xx` responses fall back immediately. Default: `2`. |
 | `SEARCH_PROVIDER_PRIORITY` | `web_search` provider priority. Supported values: `grok`, `tavily`, `exa`, `duckduckgo`. Config files may use a TOML array; environment variables may use comma-separated values. Default: `grok,tavily,exa,duckduckgo`. Omitted providers are disabled when this is configured. |
 | `FETCH_PROVIDER_PRIORITY` | Generic `web_fetch` provider priority after specialized fetchers. Supported values: `tavily`, `firecrawl`, `exa`, `plain`. Config files may use a TOML array; environment variables may use comma-separated values. Default: `tavily,firecrawl,exa,plain`. Omitted providers are disabled when this is configured. |
 | `MAP_PROVIDER_PRIORITY` | `web_map` provider priority. Supported values: `tavily`, `exa`. Config files may use a TOML array; environment variables may use comma-separated values. Default: `tavily,exa`. Omitted providers are disabled when this is configured. |
