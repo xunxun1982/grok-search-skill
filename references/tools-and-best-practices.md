@@ -10,7 +10,7 @@ Run these commands from the skill directory root, not the user's project directo
 | `web_fetch` | You already have a URL and need clean page content. |
 | `get_sources` | You need cached sources from a prior search. |
 | `web_map` | You need to discover URLs under a site. |
-| `doctor` | Configuration or connectivity needs diagnosis. |
+| `doctor` | Effective configuration, provider enablement, or upstream selection needs diagnosis. |
 
 ## `web_search`
 
@@ -25,9 +25,9 @@ Useful options:
 - `--exclude-domain example.com`
 - `--recency-days 7`
 - `--mode general|news|academic`
-- `--max-sources 8`
+- `--max-sources 8` (accepted range: `1`-`50`)
 - `--max-chars 60000`
-- `--grok-max-retries 2`
+- `--grok-max-retries 2` (capped at `5`)
 
 Rules:
 
@@ -35,7 +35,7 @@ Rules:
 - Use `--format detailed` only when inline source text is needed.
 - Save the returned `session_id`; use `get_sources` for review instead of repeating the same search.
 - If output is truncated, fetch the important URLs directly with `web_fetch`.
-- Any Grok provider error, including `429`, transport failure, parse failure, and timeout, is retryable. With the default provider priority, after `--grok-max-retries` additional attempts are exhausted, `web_search` uses Tavily, Exa, then keyless DuckDuckGo HTML search fallback.
+- Grok retries only network failures, timeouts, HTTP `408`, `429`, and `5xx` responses, using bounded backoff. Permanent `4xx` responses fall back immediately. With the default provider priority, after `--grok-max-retries` additional attempts are exhausted, `web_search` uses Tavily, Exa, then keyless DuckDuckGo HTML search fallback.
 - Use `--mode news` only when recency is part of the request; it uses the same `SEARCH_PROVIDER_PRIORITY` as general search and defaults to a 7-day freshness window unless `--recency-days` is provided. Use `--mode academic` only when paper/study discovery is explicit; it uses the same provider priority and does not guess intent.
 - Omit `--grok-max-retries` to use the configured `GROK_SEARCH_MAX_RETRIES`; pass the flag only when the single call should override config.
 - `SEARCH_PROVIDER_PRIORITY` supports `grok`, `tavily`, `exa`, and `duckduckgo`; configured lists disable omitted providers. DuckDuckGo uses keyless HTML search and supports basic domain and recency filters; Instant Answer is only an error candidate when HTML search fails.

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import html
+import io
 import ipaddress
 import json
 import os
@@ -19,7 +20,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 try:
     import tomllib
@@ -56,6 +57,18 @@ MCP_PROTOCOL_VERSION = "2025-11-25"
 HTTP_READ_CHUNK_BYTES = 64 * 1024
 HTTP_RESPONSE_MAX_BYTES = 20 * 1024 * 1024
 HTTP_ERROR_MAX_BYTES = 2000
+SOURCE_URL_MAX_CHARS = 2048
+SOURCE_PROVIDER_MAX_CHARS = 64
+WARNING_MAX_CHARS = 500
+MAX_WARNINGS = 20
+MAX_SEARCH_SOURCES = 50
+MAX_GROK_RETRIES = 5
+HTML_PARSE_MAX_EVENTS = 100_000
+DDG_FIELD_MAX_CHARS = 2000
+MAX_SSE_MESSAGES = 100_000
+MAX_SSE_EVENT_DATA_LINES = 10_000
+MAX_RECENT_URL_CANDIDATES = 1000
+LINE_BREAK_RE = re.compile(r"\r\n|[\r\n]")
 UTF8_BOM = b"\xef\xbb\xbf"
 DEFAULT_SEARCH_PROVIDER_PRIORITY = ["grok", "tavily", "exa", "duckduckgo"]
 DEFAULT_FETCH_PROVIDER_PRIORITY = ["tavily", "firecrawl", "exa", "plain"]
@@ -108,15 +121,108 @@ def configure_stdio() -> None:
 
 def clamp_text(text: str, max_chars: int | None) -> tuple[str, bool]:
     if max_chars and max_chars > 0 and len(text) > max_chars:
-        return text[:max_chars] + "\n\n[truncated]", True
+        marker = "\n\n[truncated]"
+        if max_chars <= len(marker):
+            return text[:max_chars], True
+        return text[: max_chars - len(marker)] + marker, True
     return text, False
 
 
-def strip_html(value: str) -> str:
-    value = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
-    value = re.sub(r"(?s)<[^>]+>", " ", value)
-    value = html.unescape(value)
-    return re.sub(r"\s+", " ", value).strip()
+def iter_text_lines(text: str) -> Iterator[str]:
+    start = 0
+    for separator in LINE_BREAK_RE.finditer(text):
+        yield text[start : separator.start()]
+        start = separator.end()
+    yield text[start:]
+
+
+class _HTMLTextLimitReached(Exception):
+    pass
+
+
+class _PlainTextHTMLParser(HTMLParser):
+    def __init__(self, max_chars: int, max_events: int) -> None:
+        super().__init__(convert_charrefs=True)
+        self.buffer = io.StringIO()
+        self.max_chars = max(max_chars, 0)
+        self.max_events = max(max_events, 1)
+        self.events = 0
+        self.skip_depth = 0
+        self.truncated = False
+
+    def count_event(self) -> None:
+        self.events += 1
+        if self.events > self.max_events:
+            self.truncated = True
+            raise _HTMLTextLimitReached
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.count_event()
+        del attrs
+        if tag.lower() in {"script", "style"}:
+            self.skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        self.count_event()
+        if tag.lower() in {"script", "style"} and self.skip_depth:
+            self.skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        self.count_event()
+        text = data.strip()
+        if self.skip_depth or not text:
+            return
+        remaining = self.max_chars - self.buffer.tell()
+        if remaining <= 0:
+            self.truncated = True
+            raise _HTMLTextLimitReached
+        prefix = " " if self.buffer.tell() else ""
+        value = prefix + text
+        self.buffer.write(value[:remaining])
+        if len(value) > remaining:
+            self.truncated = True
+            raise _HTMLTextLimitReached
+
+    def handle_comment(self, data: str) -> None:
+        del data
+        self.count_event()
+
+    def handle_decl(self, decl: str) -> None:
+        del decl
+        self.count_event()
+
+    def handle_pi(self, data: str) -> None:
+        del data
+        self.count_event()
+
+    def unknown_decl(self, data: str) -> None:
+        del data
+        self.count_event()
+
+
+def parse_html_text(
+    value: str,
+    max_chars: int = HTTP_RESPONSE_MAX_BYTES,
+    max_events: int | None = None,
+) -> tuple[str, bool]:
+    if max_events is None:
+        max_events = min(HTML_PARSE_MAX_EVENTS, max(max_chars * 4, 10_000))
+    parser = _PlainTextHTMLParser(max_chars, max_events)
+    try:
+        parser.feed(value)
+        parser.close()
+    except _HTMLTextLimitReached:
+        pass
+    text = re.sub(r"\s+", " ", parser.buffer.getvalue()).strip()
+    return text, parser.truncated
+
+
+def strip_html(
+    value: str,
+    max_chars: int = HTTP_RESPONSE_MAX_BYTES,
+    max_events: int | None = None,
+) -> str:
+    return parse_html_text(value, max_chars=max_chars, max_events=max_events)[0]
 
 
 def non_blank_text(value: Any) -> str | None:
@@ -151,6 +257,46 @@ def normalize_v1_base(url: str) -> str:
     if "/v1/" in base:
         return base.rsplit("/v1/", 1)[0] + "/v1"
     return base + "/v1"
+
+
+def redact_url_for_output(url: str) -> str:
+    try:
+        parsed = urllib.parse.urlsplit(str(url or ""))
+        hostname = parsed.hostname
+        if parsed.scheme not in {"http", "https"} or not hostname:
+            return "[invalid URL]"
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        port = parsed.port
+        netloc = f"{host}:{port}" if port is not None else host
+    except ValueError:
+        return "[invalid URL]"
+
+    query: list[tuple[str, str]] = []
+    for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        key_parts = {part for part in re.split(r"[^a-z0-9]+", key.lower()) if part}
+        compact_key = "".join(key_parts)
+        sensitive_keys = {
+            "apikey",
+            "accesskey",
+            "authkey",
+            "authtoken",
+            "accesstoken",
+            "bearertoken",
+            "clientsecret",
+        }
+        if compact_key in sensitive_keys or key_parts & {
+            "token",
+            "key",
+            "secret",
+            "password",
+            "passwd",
+            "auth",
+            "signature",
+            "sig",
+        }:
+            value = "[redacted]"
+        query.append((key, value))
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, urllib.parse.urlencode(query), ""))
 
 
 def default_cache_dir(explicit: str = "") -> Path:
@@ -451,11 +597,14 @@ class Config:
 
     @property
     def grok_search_max_retries(self) -> int:
-        return max(self.get_int("GROK_SEARCH_MAX_RETRIES", 2), 0)
+        return min(max(self.get_int("GROK_SEARCH_MAX_RETRIES", 2), 0), MAX_GROK_RETRIES)
 
     @property
     def fetch_max_chars(self) -> int:
-        return self.get_int("GROK_SEARCH_FETCH_MAX_CHARS", 0)
+        value = self.get_int("GROK_SEARCH_FETCH_MAX_CHARS", 0)
+        if value < 0:
+            raise ConfigError("GROK_SEARCH_FETCH_MAX_CHARS must be non-negative")
+        return value
 
     @property
     def allow_internal_fetch(self) -> bool:
@@ -463,11 +612,44 @@ class Config:
 
     @property
     def response_max_chars(self) -> int:
-        return self.get_int("GROK_SEARCH_RESPONSE_MAX_CHARS", 60000)
+        value = self.get_int("GROK_SEARCH_RESPONSE_MAX_CHARS", 60000)
+        if value < 0:
+            raise ConfigError("GROK_SEARCH_RESPONSE_MAX_CHARS must be non-negative")
+        return value
 
     @property
     def cache_dir(self) -> Path:
         return default_cache_dir(self.get("SEARCH_CACHE_DIR"))
+
+
+def config_secret_values(cfg: Config) -> list[str]:
+    secrets: set[str] = set()
+
+    def walk(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for nested_key, nested_value in value.items():
+                walk(nested_value, str(nested_key).lower())
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, key)
+        elif isinstance(value, str) and len(value) >= 4:
+            if any(marker in key for marker in ("api_key", "auth_key", "token", "secret", "password")):
+                secrets.add(value)
+
+    walk(cfg.file_values)
+    return sorted(secrets, key=len, reverse=True)
+
+
+def safe_warnings(warnings: list[str], cfg: Config) -> list[str]:
+    secrets = config_secret_values(cfg)
+    safe: list[str] = []
+    for warning in warnings[:MAX_WARNINGS]:
+        text = str(warning)
+        for secret in secrets:
+            text = text.replace(secret, "[redacted]")
+        text = re.sub(r"(?i)(bearer\s+)[^\s,;]+", r"\1[redacted]", text)
+        safe.append(clamp_text(text, WARNING_MAX_CHARS)[0])
+    return safe
 
 
 class HttpError(RuntimeError):
@@ -483,6 +665,12 @@ def is_timeout_error(exc: BaseException) -> bool:
         reason = getattr(exc, "reason", None)
         return isinstance(reason, TimeoutError) or "timed out" in str(reason).lower()
     return "timed out" in str(exc).lower()
+
+
+def is_retryable_error(exc: BaseException) -> bool:
+    if isinstance(exc, HttpError):
+        return exc.status in {0, 408, 429} or 500 <= exc.status < 600
+    return is_timeout_error(exc)
 
 
 def is_internal_address(address: str) -> bool:
@@ -641,49 +829,64 @@ def read_http_error_text(exc: urllib.error.HTTPError) -> str:
     return text
 
 
-def parse_sse_json_messages(text: str) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
+def parse_sse_json_messages(text: str) -> Iterator[dict[str, Any]]:
     data_lines: list[str] = []
+    saw_sse_data = False
+    message_count = 0
+    event_data_line_count = 0
 
-    def flush_data() -> None:
+    def flush_data() -> dict[str, Any] | None:
         if not data_lines:
-            return
+            return None
         raw = "\n".join(data_lines).strip()
         data_lines.clear()
         if not raw:
-            return
+            return None
         try:
             value = json.loads(raw)
         except json.JSONDecodeError:
-            return
-        if isinstance(value, dict):
-            messages.append(value)
+            return None
+        return value if isinstance(value, dict) else None
 
-    for line in text.splitlines():
+    for line in iter_text_lines(text):
         if not line.strip():
-            flush_data()
+            value = flush_data()
+            event_data_line_count = 0
+            if value is not None:
+                yield value
+                message_count += 1
+                if message_count >= MAX_SSE_MESSAGES:
+                    return
             continue
         if line.startswith("data:"):
+            saw_sse_data = True
+            event_data_line_count += 1
+            if event_data_line_count > MAX_SSE_EVENT_DATA_LINES:
+                return
             data_lines.append(line[5:].lstrip())
-    flush_data()
+    value = flush_data()
+    if value is not None:
+        yield value
+        message_count += 1
 
-    if not messages:
+    if not saw_sse_data and message_count == 0:
         try:
             value = json.loads(text)
         except json.JSONDecodeError:
-            return []
+            return
         if isinstance(value, dict):
-            messages.append(value)
-    return messages
+            yield value
 
 
 def first_jsonrpc_message(text: str, request_id: int) -> dict[str, Any]:
+    first_message: dict[str, Any] | None = None
     for message in parse_sse_json_messages(text):
+        if first_message is None:
+            first_message = message
         if message.get("id") == request_id:
             return message
-    messages = parse_sse_json_messages(text)
-    if messages:
-        return messages[0]
+    if first_message is not None:
+        return first_message
     raise HttpError(0, "MCP server returned no JSON-RPC message")
 
 
@@ -775,8 +978,15 @@ def search_result_status(result: dict[str, Any] | None) -> str:
     skip_reason = result.get("skip_reason")
     if isinstance(skip_reason, str) and skip_reason:
         return skip_reason
-    if result.get("answer") or result.get("sources") or result.get("urls"):
-        return ""
+    for url in result.get("urls") or []:
+        if normalize_source_url(url):
+            return ""
+    for source in result.get("sources") or []:
+        url = source.get("url") if isinstance(source, dict) else source
+        if normalize_source_url(url):
+            return ""
+    if result.get("answer"):
+        return "returned answer without sources"
     return "returned no usable results"
 
 
@@ -798,30 +1008,101 @@ def clean_found_url(url: str) -> str:
     return clean
 
 
-def find_urls(obj: Any) -> list[str]:
-    found: list[str] = []
+def normalize_source_url(value: Any) -> str | None:
+    clean = clean_found_url(str(value or ""))
+    parsed = urllib.parse.urlparse(clean)
+    if len(clean) > SOURCE_URL_MAX_CHARS or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return clean
+
+
+def find_urls(obj: Any, *, max_urls: int = MAX_SEARCH_SOURCES) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    recent_values: dict[str, None] = {}
+
+    def add(value: Any) -> None:
+        raw = str(value or "")
+        if raw in recent_values:
+            return
+        recent_values[raw] = None
+        if len(recent_values) > MAX_RECENT_URL_CANDIDATES:
+            recent_values.pop(next(iter(recent_values)))
+        if len(deduped) >= max_urls:
+            return
+        clean = normalize_source_url(value)
+        if clean and clean not in seen:
+            seen.add(clean)
+            deduped.append(clean)
 
     def walk(value: Any) -> None:
+        if len(deduped) >= max_urls:
+            return
         if isinstance(value, dict):
             for key, item in value.items():
                 if key.lower() in {"url", "href"} and isinstance(item, str) and item.startswith("http"):
-                    found.append(item)
+                    add(item)
                 walk(item)
+                if len(deduped) >= max_urls:
+                    return
         elif isinstance(value, list):
             for item in value:
                 walk(item)
+                if len(deduped) >= max_urls:
+                    return
         elif isinstance(value, str):
-            found.extend(re.findall(r"https?://[^\s\[\]>`\"']+", value))
+            for match in re.finditer(r"https?://[^\s\[\]>`\"']+", value):
+                add(match.group(0))
+                if len(deduped) >= max_urls:
+                    return
 
     walk(obj)
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for url in found:
-        clean = clean_found_url(url)
-        if clean not in seen:
-            seen.add(clean)
-            deduped.append(clean)
     return deduped
+
+
+def find_structured_urls(obj: Any, *, max_urls: int = MAX_SEARCH_SOURCES) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    recent_values: dict[str, None] = {}
+
+    def add(value: Any) -> None:
+        raw = str(value or "")
+        if raw in recent_values:
+            return
+        recent_values[raw] = None
+        if len(recent_values) > MAX_RECENT_URL_CANDIDATES:
+            recent_values.pop(next(iter(recent_values)))
+        if len(found) >= max_urls:
+            return
+        clean = normalize_source_url(value)
+        if clean and clean not in seen:
+            seen.add(clean)
+            found.append(clean)
+
+    def walk(value: Any, *, trusted: bool = False) -> None:
+        if len(found) >= max_urls:
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                normalized = key.lower()
+                if trusted and normalized in {"url", "href"} and isinstance(item, str) and item.startswith("http"):
+                    add(item)
+                elif normalized in {"annotations", "citations", "sources", "urls"}:
+                    walk(item, trusted=True)
+                elif isinstance(item, (dict, list)):
+                    walk(item, trusted=trusted)
+                if len(found) >= max_urls:
+                    return
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, trusted=trusted)
+                if len(found) >= max_urls:
+                    return
+        elif trusted and isinstance(value, str) and value.startswith("http"):
+            add(value)
+
+    walk(obj)
+    return found
 
 
 def make_source(
@@ -833,7 +1114,7 @@ def make_source(
     score: Any = None,
     published_date: Any = None,
 ) -> dict[str, Any] | None:
-    clean_url = clean_found_url(str(url or ""))
+    clean_url = normalize_source_url(url)
     if not clean_url:
         return None
     return {
@@ -875,6 +1156,38 @@ def append_source(
     return True
 
 
+def bound_source(
+    source: dict[str, Any],
+    remaining_chars: int,
+) -> tuple[dict[str, Any] | None, int, bool]:
+    url = normalize_source_url(source.get("url"))
+    if not url:
+        return None, remaining_chars, True
+
+    bounded: dict[str, Any] = {
+        "url": url,
+        "provider": str(source.get("provider") or "")[:SOURCE_PROVIDER_MAX_CHARS],
+    }
+    truncated = False
+    for key in ("title", "content", "published_date"):
+        text = str(source.get(key) or "")
+        if not text:
+            bounded[key] = ""
+            continue
+        if remaining_chars <= 0:
+            bounded[key] = ""
+            truncated = True
+            continue
+        bounded_text, was_truncated = clamp_text(text, remaining_chars)
+        bounded[key] = bounded_text
+        remaining_chars -= len(bounded_text)
+        truncated = truncated or was_truncated
+
+    score = source.get("score")
+    bounded["score"] = score if isinstance(score, (int, float)) else None
+    return bounded, remaining_chars, truncated
+
+
 def extract_ai_text(data: dict[str, Any]) -> str:
     if isinstance(data.get("output_text"), str):
         return data["output_text"].strip()
@@ -910,7 +1223,12 @@ def extract_ai_text(data: dict[str, Any]) -> str:
     return "\n".join(parts).strip()
 
 
-def ai_search(cfg: Config, query: str) -> dict[str, Any] | None:
+def ai_search(
+    cfg: Config,
+    query: str,
+    *,
+    max_sources: int = MAX_SEARCH_SOURCES,
+) -> dict[str, Any] | None:
     upstream = random_upstream(cfg, "grok_search")
     if not upstream:
         return None
@@ -940,7 +1258,7 @@ def ai_search(cfg: Config, query: str) -> dict[str, Any] | None:
 
     return {
         "answer": extract_ai_text(data),
-        "urls": find_urls(data),
+        "urls": find_structured_urls(data, max_urls=max_sources),
         "provider": "ai",
     }
 
@@ -1015,7 +1333,11 @@ def tavily_search(
     }
 
 
-def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
+def exa_sources_from_mcp_text(
+    text: str,
+    *,
+    max_sources: int = MAX_SEARCH_SOURCES,
+) -> list[dict[str, Any]]:
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -1024,6 +1346,8 @@ def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
         sources: list[dict[str, Any]] = []
         seen: set[str] = set()
         for item in data["results"]:
+            if len(sources) >= max_sources:
+                break
             if not isinstance(item, dict):
                 continue
             content = ""
@@ -1041,6 +1365,7 @@ def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
                 seen,
                 "exa",
                 url,
+                max_sources=max_sources,
                 title=title,
                 content=block,
                 published_date=item.get("publishedDate"),
@@ -1068,6 +1393,7 @@ def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
             seen,
             "exa",
             current_url,
+            max_sources=max_sources,
             title=current_title or current_url,
             content=block,
             published_date=published_match.group(1).strip() if published_match else None,
@@ -1076,7 +1402,9 @@ def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
         current_url = ""
         current_lines = []
 
-    for line in text.splitlines():
+    for line in iter_text_lines(text):
+        if len(sources) >= max_sources:
+            break
         title_match = re.match(r"^Title:\s*(.+)$", line)
         if title_match:
             flush_current()
@@ -1094,8 +1422,8 @@ def exa_sources_from_mcp_text(text: str) -> list[dict[str, Any]]:
 
     if sources:
         return sources
-    for url in find_urls({"text": text}):
-        append_source(sources, seen, "exa", url)
+    for url in find_urls({"text": text}, max_urls=max_sources):
+        append_source(sources, seen, "exa", url, max_sources=max_sources)
     return sources
 
 
@@ -1129,7 +1457,7 @@ def exa_search(
         start = int(time.time()) - recency_days * 86400
         payload["startPublishedDate"] = time.strftime("%Y-%m-%d", time.gmtime(start))
     text = exa_mcp_tool_call(EXA_MCP_URL, tool_name, payload, cfg)
-    sources = exa_sources_from_mcp_text(text)
+    sources = exa_sources_from_mcp_text(text, max_sources=max_sources)
     if text.lstrip().startswith("{") and sources:
         text = "\n\n---\n\n".join(str(item.get("content") or "") for item in sources if item.get("content"))
     return {
@@ -1153,32 +1481,68 @@ def duckduckgo_extract_result_url(href: str) -> str:
 
 
 class DuckDuckGoHTMLParser(HTMLParser):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_sources: int = MAX_SEARCH_SOURCES,
+        max_events: int = HTML_PARSE_MAX_EVENTS,
+        include_domains: list[str] | None = None,
+        exclude_domains: list[str] | None = None,
+    ) -> None:
         super().__init__(convert_charrefs=True)
+        self.max_sources = max(max_sources, 1)
+        self.max_events = max(max_events, 1)
+        self.include_domains = include_domains or []
+        self.exclude_domains = exclude_domains or []
+        self.events = 0
         self.results: list[dict[str, str]] = []
+        self.seen_urls: set[str] = set()
+        self.last_result_index: int | None = None
         self._capture: tuple[str, int] | None = None
         self._capture_depth = 0
-        self._parts: list[str] = []
+        self._buffer = io.StringIO()
+
+    def _count_event(self) -> None:
+        self.events += 1
+        if self.events > self.max_events:
+            raise _HTMLTextLimitReached
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._count_event()
         attr_map = {key.lower(): value or "" for key, value in attrs}
         classes = set(attr_map.get("class", "").split())
         if "result__a" in classes:
             url = duckduckgo_extract_result_url(attr_map.get("href", ""))
+            allowed = bool(normalize_source_url(url))
+            if self.include_domains and not url_matches_any_domain(url, self.include_domains):
+                allowed = False
+            if self.exclude_domains and url_matches_any_domain(url, self.exclude_domains):
+                allowed = False
+            if not allowed or url in self.seen_urls:
+                self.last_result_index = None
+                return
+            if len(self.results) >= self.max_sources:
+                raise _HTMLTextLimitReached
+            self.seen_urls.add(url)
             self.results.append({"title": "", "url": url, "content": ""})
-            self._start_capture("title", len(self.results) - 1)
+            self.last_result_index = len(self.results) - 1
+            self._start_capture("title", self.last_result_index)
             return
-        if "result__snippet" in classes and self.results:
-            self._start_capture("content", len(self.results) - 1)
+        if "result__snippet" in classes and self.last_result_index is not None:
+            self._start_capture("content", self.last_result_index)
             return
         if self._capture is not None:
             self._capture_depth += 1
 
     def handle_data(self, data: str) -> None:
+        self._count_event()
         if self._capture is not None:
-            self._parts.append(data)
+            remaining = DDG_FIELD_MAX_CHARS - self._buffer.tell()
+            if remaining > 0:
+                self._buffer.write(data[:remaining])
 
     def handle_endtag(self, tag: str) -> None:
+        self._count_event()
         del tag
         if self._capture is None:
             return
@@ -1189,18 +1553,30 @@ class DuckDuckGoHTMLParser(HTMLParser):
     def _start_capture(self, field: str, index: int) -> None:
         self._capture = (field, index)
         self._capture_depth = 1
-        self._parts = []
+        self._buffer = io.StringIO()
 
     def _finish_capture(self) -> None:
         if self._capture is None:
             return
         field, index = self._capture
-        text = re.sub(r"\s+", " ", "".join(self._parts)).strip()
+        text = re.sub(r"\s+", " ", self._buffer.getvalue()).strip()
         if 0 <= index < len(self.results):
             self.results[index][field] = text
         self._capture = None
         self._capture_depth = 0
-        self._parts = []
+        self._buffer = io.StringIO()
+
+    def handle_comment(self, data: str) -> None:
+        del data
+        self._count_event()
+
+    def handle_decl(self, decl: str) -> None:
+        del decl
+        self._count_event()
+
+    def handle_pi(self, data: str) -> None:
+        del data
+        self._count_event()
 
 
 def duckduckgo_time_filter(recency_days: int | None) -> str:
@@ -1245,9 +1621,16 @@ def duckduckgo_parse_html_sources(
     include_domains: list[str],
     exclude_domains: list[str],
 ) -> list[dict[str, Any]]:
-    parser = DuckDuckGoHTMLParser()
-    parser.feed(text)
-    parser.close()
+    parser = DuckDuckGoHTMLParser(
+        max_sources=max_sources,
+        include_domains=include_domains,
+        exclude_domains=exclude_domains,
+    )
+    try:
+        parser.feed(text)
+        parser.close()
+    except _HTMLTextLimitReached:
+        pass
     sources: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in parser.results:
@@ -1486,11 +1869,15 @@ def read_session(cfg: Config, session_id: str) -> dict[str, Any]:
 
 
 def command_search(args: argparse.Namespace, cfg: Config) -> None:
+    if not 1 <= args.max_sources <= MAX_SEARCH_SOURCES:
+        raise SystemExit(f"--max-sources must be between 1 and {MAX_SEARCH_SOURCES}")
+    if args.max_chars is not None and args.max_chars < 0:
+        raise SystemExit("--max-chars must be non-negative")
     mode = getattr(args, "mode", "general")
     detailed = args.format == "detailed"
     max_chars = args.max_chars or cfg.response_max_chars
     max_retries = args.grok_max_retries if args.grok_max_retries is not None else cfg.grok_search_max_retries
-    max_retries = max(max_retries, 0)
+    max_retries = min(max(max_retries, 0), MAX_GROK_RETRIES)
     recency_days = recency_days_for_mode(mode, args.recency_days)
     warnings: list[str] = []
     selected_result: dict[str, Any] | None = None
@@ -1510,7 +1897,7 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
             grok_status = "unavailable"
             for attempt in range(max_retries + 1):
                 try:
-                    result = ai_search(cfg, args.query)
+                    result = ai_search(cfg, args.query, max_sources=args.max_sources)
                     grok_status = search_result_status(result)
                     if grok_status == "not configured":
                         warnings.append("AI provider not configured; using search fallbacks.")
@@ -1520,6 +1907,10 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
                 except Exception as exc:  # noqa: BLE001
                     error_type = "timed out" if is_timeout_error(exc) else "failed"
                     warnings.append(f"AI provider attempt {attempt + 1}/{max_retries + 1} {error_type}: {exc}")
+                    if not is_retryable_error(exc):
+                        break
+                    if attempt < max_retries:
+                        time.sleep(min(2**attempt, 4))
             else:
                 warnings.append(fallback_warning(provider, grok_status, next_provider))
             if not grok_status:
@@ -1568,6 +1959,22 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
                 seen.add(url)
                 sources.append(item)
 
+    source_limit = args.max_sources
+    sources_truncated = len(sources) > source_limit
+    answer, answer_truncated = clamp_text(answer, max_chars)
+    remaining_source_chars = max(max_chars - len(answer), 0)
+    bounded_sources: list[dict[str, Any]] = []
+    for source in sources:
+        if len(bounded_sources) >= source_limit:
+            sources_truncated = True
+            break
+        bounded, remaining_source_chars, source_truncated = bound_source(source, remaining_source_chars)
+        sources_truncated = sources_truncated or source_truncated
+        if bounded is not None:
+            bounded_sources.append(bounded)
+    sources = bounded_sources
+    warnings = safe_warnings(warnings, cfg)
+
     session_payload = {
         "query": args.query,
         "mode": mode,
@@ -1577,7 +1984,6 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
         "warnings": warnings,
     }
     session_id = save_session(cfg, session_payload)
-    answer, truncated = clamp_text(answer, max_chars)
     output = {
         "session_id": session_id,
         "query": args.query,
@@ -1585,7 +1991,7 @@ def command_search(args: argparse.Namespace, cfg: Config) -> None:
         "answer": answer,
         "sources_count": len(sources),
         "sources": sources if detailed else [{k: v for k, v in s.items() if k != "content"} for s in sources],
-        "truncated": truncated,
+        "truncated": answer_truncated or sources_truncated,
         "warnings": warnings,
     }
     print(json.dumps(output, ensure_ascii=False, indent=2))
@@ -1847,17 +2253,26 @@ def exa_map(url: str, cfg: Config, max_results: int) -> list[str] | None:
     return deduped
 
 
-def plain_fetch(url: str, cfg: Config, *, allow_internal: bool = False) -> str:
+def plain_fetch(
+    url: str,
+    cfg: Config,
+    *,
+    max_chars: int | None = None,
+    allow_internal: bool = False,
+) -> tuple[str, bool]:
     text = request_text("GET", url, timeout=cfg.timeout, allow_internal=allow_internal)
-    return strip_html(text)
+    return parse_html_text(text, max_chars=max_chars or HTTP_RESPONSE_MAX_BYTES)
 
 
 def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
+    if args.max_chars is not None and args.max_chars < 0:
+        raise SystemExit("--max-chars must be non-negative")
     validate_web_url(args.url, allow_internal=cfg.allow_internal_fetch, timeout=cfg.timeout)
     max_chars = args.max_chars or cfg.fetch_max_chars or 0
     warnings: list[str] = []
     source_type = "generic"
     content: str | None = None
+    content_truncated = False
     use_external_extract = not cfg.allow_internal_fetch
     fetch_priority = provider_priority(cfg, "FETCH_PROVIDER_PRIORITY", DEFAULT_FETCH_PROVIDER_PRIORITY)
 
@@ -1879,9 +2294,21 @@ def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
         fetchers = {"tavily": tavily_extract, "firecrawl": firecrawl_extract, "exa": exa_extract}
         for name in fetch_priority:
             if name == "plain":
-                content = plain_fetch(args.url, cfg, allow_internal=cfg.allow_internal_fetch)
-                source_type = "plain-http"
-                break
+                try:
+                    plain_content, plain_truncated = plain_fetch(
+                        args.url,
+                        cfg,
+                        max_chars=max_chars or HTTP_RESPONSE_MAX_BYTES,
+                        allow_internal=cfg.allow_internal_fetch,
+                    )
+                    if plain_content:
+                        content = plain_content
+                        content_truncated = plain_truncated
+                        source_type = "plain-http"
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"plain fetch failed: {exc}")
+                continue
             fetcher = fetchers.get(name)
             if fetcher is None:
                 continue
@@ -1895,15 +2322,27 @@ def command_fetch(args: argparse.Namespace, cfg: Config) -> None:
 
     if content is None:
         if not use_external_extract and "plain" in fetch_priority:
-            content = plain_fetch(args.url, cfg, allow_internal=cfg.allow_internal_fetch)
-            source_type = "plain-http"
+            try:
+                content, content_truncated = plain_fetch(
+                    args.url,
+                    cfg,
+                    max_chars=max_chars or HTTP_RESPONSE_MAX_BYTES,
+                    allow_internal=cfg.allow_internal_fetch,
+                )
+                source_type = "plain-http"
+            except Exception as exc:  # noqa: BLE001
+                content = ""
+                source_type = "none"
+                warnings.append(f"plain fetch failed: {exc}")
         else:
             content = ""
             source_type = "none"
             warnings.append("No enabled fetch provider returned content.")
 
-    original_length = len(content)
-    content, truncated = clamp_text(content, max_chars or None)
+    original_length = len(content) + (1 if content_truncated else 0)
+    content, output_truncated = clamp_text(content, max_chars or None)
+    truncated = content_truncated or output_truncated
+    warnings = safe_warnings(warnings, cfg)
     print(
         json.dumps(
             {
@@ -1965,6 +2404,7 @@ def command_map(args: argparse.Namespace, cfg: Config) -> None:
                 break
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"{PROVIDER_LABELS.get(name, name)} map failed: {exc}")
+    warnings = safe_warnings(warnings, cfg)
     if urls is None:
         raise SystemExit("Map failed: " + ("; ".join(warnings) or "no map provider is configured"))
     page = urls[: args.max_results]
@@ -2009,7 +2449,14 @@ def command_doctor(args: argparse.Namespace, cfg: Config) -> None:
     if grok and grok.get("grok_search_api_key"):
         try:
             api_url = normalize_v1_base(grok.get("grok_search_url", "https://api.x.ai"))
-            probes.append({"name": "ai-provider", "api_url": api_url, "configured": True, "enabled": provider_enabled["grok"]})
+            probes.append(
+                {
+                    "name": "ai-provider",
+                    "api_url": redact_url_for_output(api_url),
+                    "configured": True,
+                    "enabled": provider_enabled["grok"],
+                }
+            )
         except Exception as exc:  # noqa: BLE001
             probes.append({"name": "ai-provider", "configured": True, "enabled": provider_enabled["grok"], "error": str(exc)})
     tavily = random_upstream(cfg, "tavily")
@@ -2017,7 +2464,7 @@ def command_doctor(args: argparse.Namespace, cfg: Config) -> None:
         probes.append(
             {
                 "name": "tavily",
-                "endpoint": tavily.get("tavily_api_url", "https://api.tavily.com"),
+                "endpoint": redact_url_for_output(tavily.get("tavily_api_url", "https://api.tavily.com")),
                 "configured": True,
                 "enabled": provider_enabled["tavily"],
             }
@@ -2027,7 +2474,7 @@ def command_doctor(args: argparse.Namespace, cfg: Config) -> None:
         probes.append(
             {
                 "name": "firecrawl",
-                "endpoint": firecrawl.get("firecrawl_api_url", "https://api.firecrawl.dev"),
+                "endpoint": redact_url_for_output(firecrawl.get("firecrawl_api_url", "https://api.firecrawl.dev")),
                 "configured": True,
                 "enabled": provider_enabled["firecrawl"],
             }
@@ -2108,6 +2555,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_stdio()
     parser = build_parser()
     args = parser.parse_args(argv)
+    cfg: Config | None = None
     try:
         cfg = Config(lower_keys(load_file_config()))
         args.func(args, cfg)
@@ -2115,7 +2563,12 @@ def main(argv: list[str] | None = None) -> int:
         eprint(f"Config error: {exc}")
         return 2
     except HttpError as exc:
-        eprint(f"HTTP {exc.status}: {exc}")
+        message = f"HTTP {exc.status}: {exc}"
+        if cfg is not None:
+            message = safe_warnings([message], cfg)[0]
+        else:
+            message = clamp_text(message, WARNING_MAX_CHARS)[0]
+        eprint(message)
         return 2
     except KeyboardInterrupt:
         return 130
