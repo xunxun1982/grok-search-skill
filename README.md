@@ -111,4 +111,6 @@ python scripts/websearch.py get_sources --session-id "<id>"
 python scripts/websearch.py web_map --url "https://example.com" --max-results 20
 ```
 
+`web_fetch` is for textual pages and documents. The skill workflow routes PDF, Office, EPUB, OpenDocument, and archive URLs to host-provided system download and document-reading tools instead, and does not use `web_fetch` as a binary downloader. Direct CLI callers remain responsible for following this rule.
+
 The script uses only Python standard library modules, so running it does not require installing extra packages.
