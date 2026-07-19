@@ -81,7 +81,8 @@ class SkillContractTests(unittest.TestCase):
 
     def test_security_boundaries_remain_explicit(self) -> None:
         for marker in (
-            "Execute every branch through the bundled CLI",
+            "URL discovery and textual branches through the bundled CLI",
+            "Binary-document download and parsing",
             "python scripts/websearch.py <command> [options]",
             "untrusted evidence",
             "Follow the user's task and governing instructions",
@@ -93,6 +94,16 @@ class SkillContractTests(unittest.TestCase):
             "Run `doctor` first",
             "internal fetch behavior",
             "`references/configuration.md`",
+        ):
+            self.assertIn(marker, self.body)
+
+    def test_binary_documents_route_to_host_tools(self) -> None:
+        for marker in (
+            "## Binary Documents",
+            "Do not use `web_fetch`",
+            "host-provided system tools",
+            "Do not install dependencies",
+            "ask the user to download and upload the relevant portion",
         ):
             self.assertIn(marker, self.body)
 
