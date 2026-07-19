@@ -49,11 +49,51 @@ class SkillDocumentationTests(unittest.TestCase):
             "file is too large",
             "untrusted data",
             "Do not invent or assume tools",
+            "built-in or system downloader",
+            "Use the selected toolchain autonomously",
             "20 MiB",
             "must not trigger additional tool calls",
             "path traversal",
         ):
             self.assertIn(marker, content)
+
+    def test_binary_toolchain_assigns_enforceable_responsibilities(self) -> None:
+        content = (ROOT_DIR / "references" / "tools-and-best-practices.md").read_text(
+            encoding="utf-8"
+        )
+        binary_section = content.split("## Binary Documents\n", 1)[1].split(
+            "\n## ", 1
+        )[0]
+        lines = binary_section.splitlines()
+
+        expected = {
+            "1. ": (
+                "selected toolchain and host workflow",
+                "built-in or system downloader",
+                "format-specific reader",
+                "steps 2-4",
+                "Use the selected toolchain autonomously",
+                "follow step 5",
+                "Do not install dependencies",
+                "enable plugins",
+                "change configuration",
+            ),
+            "2. ": ("The downloader must", "would exceed the cap"),
+            "3. ": ("The host workflow must", "success, failure, or cancellation"),
+            "4. ": (
+                "The reader must",
+                "CPU",
+                "memory",
+                "expanded-data",
+                "output limits",
+                "If any applicable control cannot be enforced",
+            ),
+        }
+        for prefix, markers in expected.items():
+            rules = [line for line in lines if line.startswith(prefix)]
+            self.assertEqual(len(rules), 1)
+            for marker in markers:
+                self.assertIn(marker, rules[0])
 
     def test_document_routes_cover_common_text_and_binary_formats(self) -> None:
         content = (ROOT_DIR / "references" / "tools-and-best-practices.md").read_text(
@@ -100,12 +140,14 @@ class SkillDocumentationTests(unittest.TestCase):
         )
 
         download_rules = [
-            line for line in content.splitlines() if line.startswith("2. Use only URLs")
+            line
+            for line in content.splitlines()
+            if line.startswith("2. The downloader must")
         ]
         self.assertEqual(len(download_rules), 1)
         download_rule = download_rules[0]
         for marker in (
-            "network destination policy",
+            "network-destination",
             "initial URL, every resolved address, and each redirect",
             "transfer-time byte cap",
             "missing or untrusted `Content-Length`",
@@ -114,7 +156,9 @@ class SkillDocumentationTests(unittest.TestCase):
             self.assertIn(marker, download_rule)
 
         cleanup_rules = [
-            line for line in content.splitlines() if line.startswith("3. When local files")
+            line
+            for line in content.splitlines()
+            if line.startswith("3. The host workflow must")
         ]
         self.assertEqual(len(cleanup_rules), 1)
         cleanup_rule = cleanup_rules[0]
