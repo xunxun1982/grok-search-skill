@@ -101,11 +101,19 @@ class SkillContractTests(unittest.TestCase):
         for marker in (
             "## Binary Documents",
             "Do not use `web_fetch`",
-            "host-provided system tools",
+            "Read `references/tools-and-best-practices.md` before selecting tools",
+            "host-provided built-in or system download/read toolchains",
+            "use them autonomously only when the referenced controls are enforceable",
             "Do not install dependencies",
             "ask the user to download and upload the relevant portion",
         ):
             self.assertIn(marker, self.body)
+
+        binary_rules = self.body.split("## Binary Documents\n", 1)[1].split("\n## ", 1)[0]
+        self.assertLess(
+            binary_rules.index("Read `references/tools-and-best-practices.md`"),
+            binary_rules.index("Prefer host-provided"),
+        )
 
     def test_implicit_invocation_remains_enabled(self) -> None:
         metadata = (ROOT_DIR / "agents" / "openai.yaml").read_text(encoding="utf-8")
